@@ -1,0 +1,23 @@
+[package]
+name = "xaiworkspace-tauri"
+version = "0.1.0"
+edition = "2021"
+description = "xAI Workspace desktop bootstrapper — installs Docker, runs bridge, handles OAuth"
+authors = ["xAI Workspace"]
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-process = "2"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[lib]
+name = "xaiworkspace_tauri_lib"
+crate-type = ["lib", "cdylib", "staticlib"]

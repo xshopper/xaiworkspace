@@ -1,0 +1,14 @@
+{
+  "name": "xaiworkspace-tauri",
+  "version": "0.1.0",
+  "private": true,
+  "description": "xAI Workspace desktop app — installs Docker, runs bridge, handles OAuth",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
