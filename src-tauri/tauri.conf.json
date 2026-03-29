@@ -27,6 +27,13 @@
       "csp": "default-src 'self'; connect-src https://router.xaiworkspace.com https://desktop.docker.com http://localhost:*; style-src 'self' 'unsafe-inline'"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["xaiworkspace"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["dmg", "msi", "appimage"],

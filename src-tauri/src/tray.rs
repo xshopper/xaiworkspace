@@ -10,7 +10,6 @@ use crate::config::DesktopConfig;
 /// Set up the system tray icon and menu with OAuth port toggles.
 pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> Result<(), Box<dyn std::error::Error>> {
     let open_item = MenuItem::with_id(app, "open", "Open xAI Workspace", true, None::<&str>)?;
-    let status_item = MenuItem::with_id(app, "status", "Bridge: checking...", false, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
 
     // OAuth port toggle items — one per provider, default checked (on)
@@ -34,7 +33,6 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
     // Build menu
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
         &open_item,
-        &status_item,
         &sep1,
     ];
     for item in &oauth_items {
@@ -53,6 +51,7 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
         .collect();
     let check_items = Arc::new(check_items);
 
+    let app_url = cfg.app_url.clone();
     let oauth_mgr = oauth.clone();
     let items_ref = check_items.clone();
 
@@ -63,7 +62,7 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
             let id = event.id().as_ref().to_string();
             match id.as_str() {
                 "open" => {
-                    let _ = open::that("https://app.xaiworkspace.com");
+                    let _ = open::that(&app_url);
                 }
                 "quit" => {
                     app.exit(0);
@@ -74,7 +73,6 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
                     let items = items_ref.clone();
                     tauri::async_runtime::spawn(async move {
                         let is_on = mgr.toggle(&provider).await;
-                        // Update check mark
                         for (name, item) in items.iter() {
                             if name == &provider {
                                 let _ = item.set_checked(is_on);

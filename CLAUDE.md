@@ -98,6 +98,19 @@ Runs two pm2 processes:
 
 Ports mapped: 3100 (pairing), 54545 (Claude OAuth), 8085 (Gemini), 1455 (Codex)
 
+## App Icon (X-Dot)
+
+The application icon is "X-Dot" — an X shape with a single dot above it. **Not** three dots.
+
+Icon files in `src-tauri/icons/`:
+- `tray-icon.png` / `tray-icon@2x.png` — system tray icon
+- `32x32.png`, `128x128.png`, `128x128@2x.png` — app window icons
+- `icon.icns` (macOS), `icon.ico` (Windows), `icon.png` — bundle icons
+
+Config: `tauri.conf.json` → `app.trayIcon.iconPath` and `bundle.icon[]`.
+
+**Testing**: Icon integrity is verified by `xdot-icon.spec.ts` in the frontend E2E suite (`pnpm e2e:xdot` from xaiworkspace-frontend). Tests check all Tauri icon files exist, are non-empty, and match `tauri.conf.json` references.
+
 ## Code Signing
 
 macOS: Developer ID Application certificate from Apple (xShopper Pty Ltd, Team ID D3BS8AH5D9). Stored as GitHub Actions secrets. CI signs + notarizes via `tauri-apps/tauri-action`.
