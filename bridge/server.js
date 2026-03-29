@@ -13,11 +13,30 @@ const { execFile } = require('child_process');
 const compose = require('./compose-manager');
 
 const ROUTER_URL = process.env.ROUTER_URL || 'https://router.xaiworkspace.com';
-const ROUTER_SECRET = process.env.ROUTER_SECRET || '';
+let ROUTER_SECRET = process.env.ROUTER_SECRET || '';
 const INSTANCE_ID = process.env.INSTANCE_ID || `xaiw-bridge-${require('crypto').randomBytes(8).toString('hex')}`;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
-const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
+let APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
+
+/** Fetch config from router (includes routerSecret). */
+async function fetchRouterConfig() {
+  try {
+    const url = new URL('/api/config/desktop', ROUTER_URL);
+    const resp = await fetch(url.toString(), { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return;
+    const cfg = await resp.json();
+    if (cfg.routerSecret && !ROUTER_SECRET) {
+      ROUTER_SECRET = cfg.routerSecret;
+      console.log('[config] Fetched router secret from config endpoint');
+    }
+    if (cfg.appUrl && APP_URL === 'https://xaiworkspace.com') {
+      APP_URL = cfg.appUrl;
+    }
+  } catch (err) {
+    console.warn('[config] Failed to fetch router config:', err.message);
+  }
+}
 
 let pairingCode = null;
 let pairingUrl = null;
@@ -264,7 +283,8 @@ async function registerWithRetry(maxRetries = 30, delayMs = 5000) {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[pairing] Listening on port ${PORT}`);
-  registerWithRetry();
+  // Fetch router config (includes secret) before registering
+  fetchRouterConfig().then(() => registerWithRetry());
 
   // Start compose stack scanning after a short delay
   setTimeout(() => {

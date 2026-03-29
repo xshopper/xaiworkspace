@@ -6,7 +6,7 @@ description = "xAI Workspace desktop bootstrapper — installs Docker, runs brid
 authors = ["xAI Workspace"]
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"

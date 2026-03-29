@@ -17,6 +17,9 @@ fn get_status() -> serde_json::Value {
 /// Startup: install Docker if needed, then sit in tray.
 /// No bridge provisioning — that happens via deep link from the website.
 async fn run_setup(app: AppHandle) {
+    // Wait for webview to load before emitting events
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
     let _ = app.emit("setup-progress", serde_json::json!({
         "step": "Checking Docker...",
         "percent": 20
@@ -33,38 +36,37 @@ async fn run_setup(app: AppHandle) {
         }
     }
 
-    let _ = app.emit("setup-progress", serde_json::json!({
-        "step": "Ready",
-        "percent": 100
-    }));
-
-    // Hide setup window after a short delay
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Docker ready — hide window immediately (no need to show it)
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
 }
 
-/// Handle deep link: xaiworkspace://provision?env=dev|test|prod
+/// Handle deep link: xaiworkspace://provision?router=URL&app=URL
 /// Called when user clicks "Add System" on the website.
-async fn handle_provision(app: AppHandle, env: String) {
+async fn handle_provision(app: AppHandle, params: ProvisionParams) {
+    let router_url = params.router_url;
+    let app_url = params.app_url;
+    // Show the setup window and wait for it to be ready
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    // Brief delay so webview can load and start listening for events
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     let _ = app.emit("setup-progress", serde_json::json!({
         "step": "Provisioning bridge...",
         "percent": 10
     }));
 
-    // Show the setup window
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+    // Build config from the deep link parameters
+    let mut cfg = config::DesktopConfig::default();
+    cfg.router_url = router_url;
+    cfg.app_url = app_url;
+    if let Some(image) = params.image {
+        cfg.bridge_image = image;
     }
-
-    // Load config for the requested environment
-    let cfg = match env.as_str() {
-        "dev" => config::load_env("dev").await,
-        "test" => config::load_env("test").await,
-        _ => config::load_env("prod").await,
-    };
 
     // Ensure Docker is available
     if !docker::is_available() {
@@ -91,45 +93,62 @@ async fn handle_provision(app: AppHandle, env: String) {
                 "percent": 90
             }));
             let _ = open::that(&pairing_url);
-
             let _ = app.emit("setup-progress", serde_json::json!({
                 "step": "Done!",
                 "percent": 100
             }));
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.hide();
-            }
         }
         Err(e) => {
-            let _ = app.emit("setup-error", serde_json::json!({ "error": e }));
+            // Bridge container started but pairing failed — still usable
+            let _ = app.emit("setup-progress", serde_json::json!({
+                "step": "Bridge started (pairing pending)",
+                "percent": 100
+            }));
+            eprintln!("[provision] Bridge pairing error: {e}");
         }
     }
 
-    // Start OAuth listeners for the provisioned environment
+    // Always hide window after provisioning attempt
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+
+    // Start OAuth listeners
     let oauth_mgr = Arc::new(oauth::OAuthManager::new(cfg.router_url.clone()));
     oauth_mgr.start_all(&cfg).await;
 }
 
-/// Parse deep link URL and extract env parameter.
-/// Handles: xaiworkspace://provision?env=dev (host=provision, path empty)
-///          xaiworkspace:///provision?env=dev (host empty, path=/provision)
-fn parse_deep_link(url: &str) -> Option<String> {
+/// Parsed deep link parameters.
+struct ProvisionParams {
+    router_url: String,
+    app_url: String,
+    image: Option<String>,
+}
+
+/// Parse deep link URL and extract provision parameters.
+/// Format: xaiworkspace://provision?router=URL&app=URL&image=IMAGE
+fn parse_deep_link(url: &str) -> Option<ProvisionParams> {
     let parsed = url::Url::parse(url).ok()?;
     if parsed.scheme() != "xaiworkspace" {
         return None;
     }
-    // host_str() returns "provision" for xaiworkspace://provision?env=dev
     let is_provision = parsed.host_str() == Some("provision")
         || parsed.path().starts_with("/provision");
     if !is_provision {
         return None;
     }
-    let env = parsed.query_pairs()
-        .find(|(k, _)| k == "env")
+    let router_url = parsed.query_pairs()
+        .find(|(k, _)| k == "router")
+        .map(|(_, v)| v.to_string())?;
+    let app_url = parsed.query_pairs()
+        .find(|(k, _)| k == "app")
         .map(|(_, v)| v.to_string())
-        .unwrap_or_else(|| "prod".to_string());
-    Some(env)
+        .unwrap_or_else(|| "https://xaiworkspace.com".to_string());
+    let image = parsed.query_pairs()
+        .find(|(k, _)| k == "image")
+        .map(|(_, v)| v.to_string());
+    Some(ProvisionParams { router_url, app_url, image })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -138,10 +157,10 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Deep link arrives as args when another instance tries to start
             if let Some(url) = args.get(1) {
-                if let Some(env) = parse_deep_link(url) {
+                if let Some(params) = parse_deep_link(url) {
                     let handle = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        handle_provision(handle, env).await;
+                        handle_provision(handle, params).await;
                     });
                     return;
                 }
@@ -164,17 +183,38 @@ pub fn run() {
                 eprintln!("[Tray] Failed to set up system tray: {e}");
             }
 
-            // Register deep link handler via plugin
+            // Register deep link scheme + handler
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
+
+                // Register scheme with OS (Linux/Windows — required for xdg-open/start to work)
+                if let Err(e) = app.deep_link().register("xaiworkspace") {
+                    eprintln!("[deep-link] Failed to register scheme: {e}");
+                }
+
+                // Check if app was launched with a deep link URL
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    let handle = app.handle().clone();
+                    for url in &urls {
+                        if let Some(params) = parse_deep_link(url.as_str()) {
+                            let h = handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                handle_provision(h, params).await;
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                // Listen for subsequent deep link events (macOS + single-instance forwarding)
                 let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
-                        if let Some(env) = parse_deep_link(url.as_str()) {
+                        if let Some(params) = parse_deep_link(url.as_str()) {
                             let h = handle.clone();
                             tauri::async_runtime::spawn(async move {
-                                handle_provision(h, env).await;
+                                handle_provision(h, params).await;
                             });
                             break;
                         }

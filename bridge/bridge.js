@@ -10,10 +10,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 const WebSocket = require('ws');
 
-const ROUTER = process.env.ROUTER_WS;
-const AUTH = JSON.parse(process.env.AUTH_JSON);
+// Derive ROUTER_WS from ROUTER_URL if not explicitly set
+const ROUTER = process.env.ROUTER_WS
+  || (process.env.ROUTER_URL
+    ? process.env.ROUTER_URL.replace(/\/$/, '').replace(/^http/, 'ws') + '/ws/gateway'
+    : null);
+const AUTH = JSON.parse(process.env.AUTH_JSON || '{}');
 
-if (!ROUTER) { console.error('[bridge] ROUTER_WS is required'); process.exit(1); }
+if (!ROUTER) { console.error('[bridge] ROUTER_WS or ROUTER_URL is required'); process.exit(1); }
 
 let routerWs = null;
 let authenticated = false;
