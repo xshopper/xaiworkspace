@@ -2,7 +2,7 @@ use std::process::Command;
 use tauri::{AppHandle, Emitter};
 
 const CONTAINER_NAME: &str = "xaiw-bridge";
-const IMAGE: &str = "xaiworkspace/bridge:latest";
+const IMAGE: &str = "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest";
 const HEALTH_URL: &str = "http://localhost:3100/health";
 
 /// Check if the bridge container is already running.
