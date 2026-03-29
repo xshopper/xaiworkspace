@@ -14,7 +14,7 @@ const ROUTER_URL = process.env.ROUTER_URL || 'https://router.xaiworkspace.com';
 const ROUTER_SECRET = process.env.ROUTER_SECRET || '';
 const INSTANCE_ID = process.env.INSTANCE_ID || `bridge-${require('crypto').randomBytes(8).toString('hex')}`;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
-const APP_URL = process.env.APP_URL || 'https://app.xaiworkspace.com';
+const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 
 let pairingCode = null;
 let pairingUrl = null;

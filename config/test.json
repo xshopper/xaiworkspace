@@ -7,5 +7,5 @@
     { "name": "codex", "port": 1455 }
   ],
   "routerUrl": "https://router-test.xaiworkspace.com",
-  "appUrl": "https://test.xaiworkspace.com"
+  "appUrl": "https://xaiworkspace.com"
 }

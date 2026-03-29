@@ -32,7 +32,7 @@ impl Default for DesktopConfig {
                 OAuthProvider { name: "codex".into(), port: 1455 },
             ],
             router_url: ROUTER_URL.into(),
-            app_url: "https://app.xaiworkspace.com".into(),
+            app_url: "https://xaiworkspace.com".into(),
         }
     }
 }

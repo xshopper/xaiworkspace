@@ -62,11 +62,15 @@ pub async fn run(app: &AppHandle, cfg: &DesktopConfig) -> Result<(), String> {
             .status()
             .map_err(|e| format!("Failed to start container: {e}"))?;
     } else {
-        // Build port mapping args from config
+        // Build port mapping + environment args from config
+        let router_ws = cfg.router_url.replace("https://", "wss://").replace("http://", "ws://");
         let mut args = vec![
             "run".to_string(), "-d".into(),
             "--name".into(), CONTAINER_NAME.into(),
             "--restart".into(), "unless-stopped".into(),
+            "-e".into(), format!("ROUTER_URL={}", cfg.router_url),
+            "-e".into(), format!("ROUTER_WS={router_ws}/ws/gateway"),
+            "-e".into(), format!("APP_URL={}", cfg.app_url),
         ];
         for port in &cfg.bridge_ports {
             args.push("-p".into());
