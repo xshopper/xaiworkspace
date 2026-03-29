@@ -1,3 +1,4 @@
+mod config;
 mod docker;
 mod bridge;
 mod oauth;
@@ -14,6 +15,13 @@ fn get_status() -> serde_json::Value {
 }
 
 async fn run_setup(app: AppHandle) {
+    // Step 0: Load config (local file > router API > defaults)
+    let _ = app.emit("setup-progress", serde_json::json!({
+        "step": "Loading config...",
+        "percent": 5
+    }));
+    let cfg = config::load().await;
+
     // Step 1: Check Docker
     let _ = app.emit("setup-progress", serde_json::json!({
         "step": "Checking Docker...",
@@ -30,7 +38,7 @@ async fn run_setup(app: AppHandle) {
 
     // Step 3: Run bridge container
     if !bridge::is_running() {
-        if let Err(e) = bridge::run(&app).await {
+        if let Err(e) = bridge::run(&app, &cfg).await {
             let _ = app.emit("setup-error", serde_json::json!({ "error": e }));
             return;
         }
@@ -61,11 +69,9 @@ async fn run_setup(app: AppHandle) {
         let _ = window.hide();
     }
 
-    // Start OAuth port listeners.
-    // These will silently skip any port already bound by the bridge container.
-    // If bridge maps -p 54545:54545, the bridge handles OAuth on that port.
-    // Tauri only catches ports the bridge doesn't map (e.g., EC2-only users).
-    oauth::start_listeners();
+    // Start OAuth port listeners from config.
+    // Ports already bound by the bridge container are silently skipped.
+    oauth::start_listeners(&cfg);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

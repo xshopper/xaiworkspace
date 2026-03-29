@@ -1,8 +1,8 @@
 use std::process::Command;
 use tauri::{AppHandle, Emitter};
+use crate::config::DesktopConfig;
 
 const CONTAINER_NAME: &str = "xaiw-bridge";
-const IMAGE: &str = "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest";
 const HEALTH_URL: &str = "http://localhost:3100/health";
 
 /// Check if the bridge container is already running.
@@ -24,23 +24,31 @@ fn container_exists() -> bool {
 }
 
 /// Pull the bridge image and run the container.
-///
-/// If the container already exists but is stopped, start it.
-/// If it doesn't exist, create it with all required port mappings.
-pub async fn run(app: &AppHandle) -> Result<(), String> {
-    let _ = app.emit("setup-progress", serde_json::json!({
-        "step": "Pulling bridge image...",
-        "percent": 55
-    }));
+/// Image name and ports come from config (router API or local override).
+pub async fn run(app: &AppHandle, cfg: &DesktopConfig) -> Result<(), String> {
+    let image = &cfg.bridge_image;
 
-    // Pull latest image
-    let pull = Command::new("docker")
-        .args(["pull", IMAGE])
-        .status()
-        .map_err(|e| format!("Failed to pull image: {e}"))?;
+    // Check if image exists locally first
+    let image_exists = Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    if !pull.success() {
-        return Err("Failed to pull bridge image".into());
+    if !image_exists {
+        let _ = app.emit("setup-progress", serde_json::json!({
+            "step": "Pulling bridge image...",
+            "percent": 55
+        }));
+
+        let pull = Command::new("docker")
+            .args(["pull", image])
+            .status()
+            .map_err(|e| format!("Failed to pull image: {e}"))?;
+
+        if !pull.success() {
+            return Err("Failed to pull bridge image. Check your internet connection and image registry access.".into());
+        }
     }
 
     let _ = app.emit("setup-progress", serde_json::json!({
@@ -49,28 +57,25 @@ pub async fn run(app: &AppHandle) -> Result<(), String> {
     }));
 
     if container_exists() {
-        // Container exists — just start it
         Command::new("docker")
             .args(["start", CONTAINER_NAME])
             .status()
             .map_err(|e| format!("Failed to start container: {e}"))?;
     } else {
-        // Create new container with all port mappings:
-        // 3100  — bridge web (pairing redirect + health)
-        // 54545 — Claude OAuth callback
-        // 8085  — Gemini OAuth callback
-        // 1455  — Codex OAuth callback
+        // Build port mapping args from config
+        let mut args = vec![
+            "run".to_string(), "-d".into(),
+            "--name".into(), CONTAINER_NAME.into(),
+            "--restart".into(), "unless-stopped".into(),
+        ];
+        for port in &cfg.bridge_ports {
+            args.push("-p".into());
+            args.push(format!("{port}:{port}"));
+        }
+        args.push(image.to_string());
+
         let status = Command::new("docker")
-            .args([
-                "run", "-d",
-                "--name", CONTAINER_NAME,
-                "--restart", "unless-stopped",
-                "-p", "3100:3100",
-                "-p", "54545:54545",
-                "-p", "8085:8085",
-                "-p", "1455:1455",
-                IMAGE,
-            ])
+            .args(&args)
             .status()
             .map_err(|e| format!("Failed to run container: {e}"))?;
 
@@ -106,7 +111,6 @@ pub async fn wait_for_health(app: &AppHandle, timeout_secs: u64) -> Result<(), S
 }
 
 /// Open the bridge's localhost page in the default browser.
-/// The bridge serves a redirect to https://app.xaiworkspace.com/link?code=XXXX
 pub fn open_in_browser() {
     let _ = open::that("http://localhost:3100");
 }

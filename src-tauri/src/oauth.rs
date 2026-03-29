@@ -1,14 +1,6 @@
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const ROUTER_URL: &str = "https://router.xaiworkspace.com";
-
-/// OAuth provider port mappings.
-const PROVIDERS: &[(&str, u16)] = &[
-    ("claude", 54545),
-    ("gemini", 8085),
-    ("codex", 1455),
-];
+use crate::config::DesktopConfig;
 
 const SUCCESS_HTML: &str = r##"<!DOCTYPE html>
 <html>
@@ -49,17 +41,20 @@ const ERROR_HTML: &str = r##"<!DOCTYPE html>
 </body>
 </html>"##;
 
-/// Start OAuth listeners on all provider ports.
-/// Each listener catches OAuth callbacks and forwards the code to the router.
+/// Start OAuth listeners on all provider ports from config.
 /// Spawns a background task per port; returns immediately.
 /// Ports already bound by the bridge container are silently skipped.
-pub fn start_listeners() {
-    for &(provider, port) in PROVIDERS {
-        tokio::spawn(listen_on_port(provider.to_string(), port));
+pub fn start_listeners(cfg: &DesktopConfig) {
+    let router_url = cfg.router_url.clone();
+    for provider in &cfg.oauth_providers {
+        let name = provider.name.clone();
+        let port = provider.port;
+        let url = router_url.clone();
+        tokio::spawn(listen_on_port(name, port, url));
     }
 }
 
-async fn listen_on_port(provider: String, port: u16) {
+async fn listen_on_port(provider: String, port: u16, router_url: String) {
     let addr = format!("127.0.0.1:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -79,6 +74,7 @@ async fn listen_on_port(provider: String, port: u16) {
         };
 
         let provider = provider.clone();
+        let router = router_url.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let n = match stream.read(&mut buf).await {
@@ -90,9 +86,8 @@ async fn listen_on_port(provider: String, port: u16) {
 
             // Parse GET /callback?code=XXX&state=YYY from the HTTP request line
             let (code, state) = parse_callback(&request);
-
             let (status, body) = if let Some(code) = code {
-                match forward_to_router(&provider, &code, state.as_deref()).await {
+                match forward_to_router(&router, &provider, &code, state.as_deref()).await {
                     Ok(_) => ("200 OK", SUCCESS_HTML),
                     Err(_) => ("500 Internal Server Error", ERROR_HTML),
                 }
@@ -157,12 +152,13 @@ fn urlencoding_decode(s: &str) -> String {
 
 /// Forward the OAuth code to the router API.
 async fn forward_to_router(
+    router_url: &str,
     provider: &str,
     code: &str,
     state: Option<&str>,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let url = format!("{ROUTER_URL}/oauth/bridge/{provider}");
+    let url = format!("{router_url}/oauth/bridge/{provider}");
 
     // Router secret for authentication — read from env or use default for local dev
     let router_secret = std::env::var("ROUTER_SECRET").unwrap_or_default();

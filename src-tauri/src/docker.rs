@@ -126,9 +126,13 @@ async fn install_windows() -> Result<(), String> {
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     tokio::fs::write(&tmp, &bytes).await.map_err(|e| e.to_string())?;
 
-    // Run installer silently
-    Command::new(&tmp)
-        .args(["install", "--quiet", "--accept-license"])
+    // Run installer with UAC elevation (triggers Windows admin prompt)
+    Command::new("powershell")
+        .args([
+            "-Command",
+            &format!("Start-Process '{}' -ArgumentList 'install','--quiet','--accept-license' -Verb RunAs -Wait",
+                tmp.display()),
+        ])
         .status()
         .map_err(|e| format!("Docker installer failed: {e}"))?;
 
@@ -147,8 +151,19 @@ async fn install_windows() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 async fn install_linux() -> Result<(), String> {
-    let status = Command::new("sh")
-        .args(["-c", "curl -fsSL https://get.docker.com | sh"])
+    // Use pkexec for graphical sudo prompt (works in desktop environments)
+    // Falls back to sudo if pkexec is not available
+    let has_pkexec = Command::new("which").arg("pkexec").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    let (cmd, args) = if has_pkexec {
+        ("pkexec", vec!["sh", "-c", "curl -fsSL https://get.docker.com | sh"])
+    } else {
+        ("sudo", vec!["sh", "-c", "curl -fsSL https://get.docker.com | sh"])
+    };
+
+    let status = Command::new(cmd)
+        .args(&args)
         .status()
         .map_err(|e| format!("Docker install failed: {e}"))?;
 
@@ -158,7 +173,8 @@ async fn install_linux() -> Result<(), String> {
 
     // Add current user to docker group
     if let Ok(user) = std::env::var("USER") {
-        Command::new("sudo")
+        let elevate = if has_pkexec { "pkexec" } else { "sudo" };
+        Command::new(elevate)
             .args(["usermod", "-aG", "docker", &user])
             .status()
             .ok();

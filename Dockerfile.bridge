@@ -1,0 +1,17 @@
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+    && npm install -g pm2
+
+WORKDIR /opt/bridge
+
+COPY bridge/package.json bridge/package-lock.json* ./
+RUN npm install --omit=dev
+
+COPY bridge/ ./
+
+EXPOSE 3100 54545 8085 1455
+
+HEALTHCHECK --interval=5s --timeout=3s CMD curl -sf http://localhost:3100/health || exit 1
+
+CMD ["pm2-runtime", "start", "ecosystem.config.js", "--raw"]
