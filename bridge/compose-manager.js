@@ -3,6 +3,7 @@
  * Instance Manager — manages workspace containers on the local host.
  *
  * Uses Docker Compose to create/remove/list workspace containers.
+ * Each user (chatId) gets their own compose project and file for isolation.
  * The bridge only manages LOCAL containers — AWS provisioning is done by the router.
  */
 const fs = require('fs');
@@ -10,16 +11,34 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const COMPOSE_DIR = process.env.COMPOSE_DIR || '/data';
-const COMPOSE_FILE = path.join(COMPOSE_DIR, 'docker-compose.yml');
-const COMPOSE_PROJECT = process.env.COMPOSE_PROJECT_NAME || 'xaiworkspace';
 const WORKSPACE_IMAGE = process.env.WORKSPACE_IMAGE || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest';
 const NETWORK_NAME = process.env.COMPOSE_NETWORK || 'xai-dev';
 
-const services = new Map(); // instanceId → config
+// Per-user compose stacks: Map<chatId, Map<instanceId, config>>
+const userStacks = new Map();
 
-function writeComposeFile() {
+/** Get or create a user's service map. */
+function getUserServices(chatId) {
+  if (!userStacks.has(chatId)) userStacks.set(chatId, new Map());
+  return userStacks.get(chatId);
+}
+
+/** Compose project name for a user. */
+function projectName(chatId) {
+  // Sanitize chatId for Docker project name (alphanumeric + underscore)
+  const safe = chatId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+  return `xaiworkspace-${safe}`;
+}
+
+/** Compose file path for a user. */
+function composeFilePath(chatId) {
+  return path.join(COMPOSE_DIR, `docker-compose-${chatId.replace(/[^a-zA-Z0-9_-]/g, '')}.yml`);
+}
+
+function writeComposeFile(chatId) {
+  const services = getUserServices(chatId);
   fs.mkdirSync(COMPOSE_DIR, { recursive: true });
-  let yaml = 'version: "3.8"\n\nservices:\n';
+  let yaml = 'services:\n';
   for (const [name, config] of services) {
     yaml += `  ${name}:\n`;
     yaml += `    image: ${config.image || WORKSPACE_IMAGE}\n`;
@@ -40,60 +59,99 @@ function writeComposeFile() {
     yaml += '\n';
   }
   yaml += `networks:\n  default:\n    name: ${NETWORK_NAME}\n    external: true\n`;
-  fs.writeFileSync(COMPOSE_FILE, yaml);
+  const filePath = composeFilePath(chatId);
+  fs.writeFileSync(filePath, yaml);
 }
 
-function composeUp() {
+function composeUp(chatId) {
+  const file = composeFilePath(chatId);
+  const project = projectName(chatId);
   try {
-    execFileSync('docker', ['compose', '-p', COMPOSE_PROJECT, '-f', COMPOSE_FILE, 'up', '-d', '--remove-orphans'], {
+    execFileSync('docker', ['compose', '-p', project, '-f', file, 'up', '-d', '--remove-orphans'], {
       stdio: 'inherit', timeout: 60000,
     });
   } catch (err) {
-    console.error('[compose] docker compose up failed:', err.message);
+    console.error(`[compose] docker compose up failed for ${chatId}:`, err.message);
   }
 }
 
 function addInstance(instanceId, config = {}) {
+  const chatId = config.env?.CHAT_ID || 'default';
+  const services = getUserServices(chatId);
   services.set(instanceId, {
     image: config.image || WORKSPACE_IMAGE,
     env: config.env || {},
     ports: config.ports || [],
     volumes: config.volumes || [],
   });
-  writeComposeFile();
-  composeUp();
-  console.log(`[compose] Added instance: ${instanceId}`);
+  writeComposeFile(chatId);
+  composeUp(chatId);
+  console.log(`[compose] Added instance: ${instanceId} (stack: ${projectName(chatId)})`);
 }
 
 function removeInstance(instanceId) {
-  if (!services.has(instanceId)) return false;
-  services.delete(instanceId);
-  writeComposeFile();
-  composeUp();
-  console.log(`[compose] Removed instance: ${instanceId}`);
-  return true;
+  // Find which user stack this instance belongs to
+  for (const [chatId, services] of userStacks) {
+    if (services.has(instanceId)) {
+      services.delete(instanceId);
+      writeComposeFile(chatId);
+      composeUp(chatId);
+      console.log(`[compose] Removed instance: ${instanceId} (stack: ${projectName(chatId)})`);
+      return true;
+    }
+  }
+  // Not in any compose stack — try direct docker rm
+  try {
+    execFileSync('docker', ['rm', '-f', instanceId], { timeout: 15000 });
+    console.log(`[compose] Removed standalone instance: ${instanceId}`);
+    return true;
+  } catch { return false; }
 }
 
 function listInstances() {
   const found = new Map(); // name → { name, status, health }
 
-  // 1. Check compose-managed containers
-  if (fs.existsSync(COMPOSE_FILE)) {
+  // 1. Check all per-user compose stacks
+  try {
+    const files = fs.readdirSync(COMPOSE_DIR).filter(f => f.startsWith('docker-compose-') && f.endsWith('.yml'));
+    for (const file of files) {
+      const filePath = path.join(COMPOSE_DIR, file);
+      // Extract chatId from filename: docker-compose-{chatId}.yml
+      const chatId = file.replace('docker-compose-', '').replace('.yml', '');
+      const project = projectName(chatId);
+      try {
+        const output = execFileSync('docker', ['compose', '-p', project, '-f', filePath, 'ps', '--format', 'json'], {
+          timeout: 10000,
+        }).toString();
+        for (const line of output.trim().split('\n').filter(Boolean)) {
+          try {
+            const c = JSON.parse(line);
+            const name = c.Name || c.Service;
+            if (name) found.set(name, { name, status: c.State || 'unknown', health: c.Health || '' });
+          } catch { /* skip */ }
+        }
+      } catch { /* ignore */ }
+    }
+  } catch { /* COMPOSE_DIR doesn't exist yet */ }
+
+  // 2. Also check legacy single compose file
+  const legacyFile = path.join(COMPOSE_DIR, 'docker-compose.yml');
+  if (fs.existsSync(legacyFile)) {
     try {
-      const output = execFileSync('docker', ['compose', '-p', COMPOSE_PROJECT, '-f', COMPOSE_FILE, 'ps', '--format', 'json'], {
+      const output = execFileSync('docker', ['compose', '-p', 'xaiworkspace', '-f', legacyFile, 'ps', '--format', 'json'], {
         timeout: 10000,
       }).toString();
       for (const line of output.trim().split('\n').filter(Boolean)) {
         try {
           const c = JSON.parse(line);
           const name = c.Name || c.Service;
-          if (name) found.set(name, { name, status: c.State || 'unknown', health: c.Health || '' });
+          if (name && !found.has(name)) found.set(name, { name, status: c.State || 'unknown', health: c.Health || '' });
         } catch { /* skip */ }
       }
     } catch { /* ignore */ }
   }
 
-  // 2. Discover orphaned workspace containers (xaiworkspace-w_*) not in compose
+  // 3. Discover orphaned workspace containers (xaiworkspace-w_*) not in any compose
   try {
     const output = execFileSync('docker', [
       'ps', '-a', '--filter', 'name=xaiworkspace-w_', '--format', '{{.Names}} {{.State}}',
