@@ -106,7 +106,6 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
     let check_items = Arc::new(check_items);
 
     let app_url = cfg.app_url.clone();
-    let bridge_image = cfg.bridge_image.clone();
     let oauth_mgr = oauth.clone();
     let items_ref = check_items.clone();
     let bridge_status_item = bridge_item;
