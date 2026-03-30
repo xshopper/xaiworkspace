@@ -42,11 +42,12 @@ async fn run_setup(app: AppHandle) {
     }
 }
 
-/// Handle deep link: xaiworkspace://provision?router=URL&app=URL
+/// Handle deep link: xaiworkspace://provision?router=URL&app=URL&token=JWT
 /// Called when user clicks "Add System" on the website.
 async fn handle_provision(app: AppHandle, params: ProvisionParams) {
     let router_url = params.router_url;
     let app_url = params.app_url;
+    let token = params.token;
     // Show the setup window and wait for it to be ready
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -86,7 +87,7 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
         "percent": 50
     }));
 
-    match bridge::create_new_bridge(&cfg).await {
+    match bridge::create_new_bridge(&cfg, token.as_deref()).await {
         Ok(pairing_url) => {
             let _ = app.emit("setup-progress", serde_json::json!({
                 "step": "Opening browser...",
@@ -123,11 +124,12 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
 struct ProvisionParams {
     router_url: String,
     app_url: String,
+    token: Option<String>,
     image: Option<String>,
 }
 
 /// Parse deep link URL and extract provision parameters.
-/// Format: xaiworkspace://provision?router=URL&app=URL&image=IMAGE
+/// Format: xaiworkspace://provision?router=URL&app=URL&token=JWT&image=IMAGE
 fn parse_deep_link(url: &str) -> Option<ProvisionParams> {
     let parsed = url::Url::parse(url).ok()?;
     if parsed.scheme() != "xaiworkspace" {
@@ -145,10 +147,14 @@ fn parse_deep_link(url: &str) -> Option<ProvisionParams> {
         .find(|(k, _)| k == "app")
         .map(|(_, v)| v.to_string())
         .unwrap_or_else(|| "https://xaiworkspace.com".to_string());
+    let token = parsed.query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.to_string())
+        .filter(|t| !t.is_empty());
     let image = parsed.query_pairs()
         .find(|(k, _)| k == "image")
         .map(|(_, v)| v.to_string());
-    Some(ProvisionParams { router_url, app_url, image })
+    Some(ProvisionParams { router_url, app_url, token, image })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

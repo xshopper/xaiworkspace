@@ -54,7 +54,9 @@ async function registerBridge() {
       body: JSON.stringify({
         bridgeId: INSTANCE_ID,
         port: PORT,
-        region: 'local',
+        region: process.env.REGION || 'local',
+        provider: process.env.PROVIDER || 'local',
+        version: require('./package.json').version,
       }),
     });
 
@@ -234,14 +236,14 @@ async function reportInstanceGone(instanceId) {
   }
 }
 
-/** Report container status to the router. */
+/** Report container status to the router (also links instance to this bridge). */
 async function reportInstanceStatus(instanceId, status) {
   try {
     const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/status`, ROUTER_URL);
     await fetch(url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-router-secret': ROUTER_SECRET },
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, bridgeId: INSTANCE_ID }),
     });
   } catch { /* best effort */ }
 }

@@ -53,6 +53,11 @@ function connectRouter() {
         handleExec(msg);
         return;
       }
+      // Handle provision command — create a workspace container
+      if (msg.type === 'provision_instance' && msg.instanceId) {
+        handleProvision(msg);
+        return;
+      }
     } catch {}
   });
 
@@ -70,6 +75,49 @@ function connectRouter() {
   pingInterval = setInterval(() => {
     if (routerWs?.readyState === WebSocket.OPEN) routerWs.ping();
   }, 30000);
+}
+
+// ── Provision: create a workspace container via Docker ────────────────────
+function handleProvision(msg) {
+  const { instanceId, image, env } = msg;
+  const { execFileSync } = require('child_process');
+
+  console.log(`[bridge] Provisioning workspace: ${instanceId} (image: ${image})`);
+
+  try {
+    const args = ['run', '-d', '--name', instanceId, '--restart', 'unless-stopped'];
+
+    // Pass environment variables
+    if (env) {
+      for (const [k, v] of Object.entries(env)) {
+        args.push('-e', `${k}=${v}`);
+      }
+    }
+
+    args.push(image || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest');
+
+    execFileSync('docker', args, { timeout: 60_000 });
+    console.log(`[bridge] Workspace ${instanceId} started`);
+
+    // Notify router
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({
+        type: 'provision_result',
+        instanceId,
+        status: 'started',
+      }));
+    }
+  } catch (err) {
+    console.error(`[bridge] Provision failed for ${instanceId}:`, err.message);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({
+        type: 'provision_result',
+        instanceId,
+        status: 'failed',
+        error: err.message,
+      }));
+    }
+  }
 }
 
 // ── Exec: run commands locally, stream output back to router ──────────────

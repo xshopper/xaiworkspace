@@ -75,18 +75,38 @@ function removeInstance(instanceId) {
 }
 
 function listInstances() {
-  if (!fs.existsSync(COMPOSE_FILE)) return [];
+  const found = new Map(); // name → { name, status, health }
+
+  // 1. Check compose-managed containers
+  if (fs.existsSync(COMPOSE_FILE)) {
+    try {
+      const output = execFileSync('docker', ['compose', '-p', COMPOSE_PROJECT, '-f', COMPOSE_FILE, 'ps', '--format', 'json'], {
+        timeout: 10000,
+      }).toString();
+      for (const line of output.trim().split('\n').filter(Boolean)) {
+        try {
+          const c = JSON.parse(line);
+          const name = c.Name || c.Service;
+          if (name) found.set(name, { name, status: c.State || 'unknown', health: c.Health || '' });
+        } catch { /* skip */ }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // 2. Discover orphaned workspace containers (xaiworkspace-w_*) not in compose
   try {
-    const output = execFileSync('docker', ['compose', '-p', COMPOSE_PROJECT, '-f', COMPOSE_FILE, 'ps', '--format', 'json'], {
-      timeout: 10000,
-    }).toString();
-    return output.trim().split('\n').filter(Boolean).map(line => {
-      try {
-        const c = JSON.parse(line);
-        return { name: c.Name || c.Service, status: c.State || 'unknown', health: c.Health || '' };
-      } catch { return null; }
-    }).filter(Boolean);
-  } catch { return []; }
+    const output = execFileSync('docker', [
+      'ps', '-a', '--filter', 'name=xaiworkspace-w_', '--format', '{{.Names}} {{.State}}',
+    ], { timeout: 10000 }).toString();
+    for (const line of output.trim().split('\n').filter(Boolean)) {
+      const [name, state] = line.split(' ');
+      if (name && !found.has(name)) {
+        found.set(name, { name, status: state || 'unknown', health: '' });
+      }
+    }
+  } catch { /* ignore */ }
+
+  return Array.from(found.values());
 }
 
 module.exports = { addInstance, removeInstance, listInstances };
