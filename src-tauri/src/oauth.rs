@@ -233,7 +233,10 @@ async fn forward_to_router(
     let client = reqwest::Client::new();
     let url = format!("{router_url}/oauth/bridge/{provider}");
 
-    let router_secret = std::env::var("ROUTER_SECRET").unwrap_or_default();
+    let router_secret = std::env::var("ROUTER_SECRET").unwrap_or_else(|_| {
+        eprintln!("[OAuth] WARNING: ROUTER_SECRET env var not set — OAuth callback forwarding will fail auth");
+        String::new()
+    });
 
     let mut body = serde_json::json!({ "code": code });
     if let Some(s) = state {

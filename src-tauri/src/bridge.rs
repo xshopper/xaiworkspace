@@ -91,11 +91,23 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
             }
             Err(e) => {
                 eprintln!("[bridge] Warning: failed to fetch secret ({e}), falling back to env var");
-                std::env::var("ROUTER_SECRET").unwrap_or_default()
+                match std::env::var("ROUTER_SECRET") {
+                    Ok(s) if !s.is_empty() => s,
+                    _ => {
+                        eprintln!("[bridge] ERROR: ROUTER_SECRET env var not set and authenticated fetch failed — bridge will not authenticate with router");
+                        return Err("ROUTER_SECRET not available: authenticated fetch failed and env var not set".into());
+                    }
+                }
             }
         }
     } else {
-        std::env::var("ROUTER_SECRET").unwrap_or_default()
+        match std::env::var("ROUTER_SECRET") {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                eprintln!("[bridge] ERROR: ROUTER_SECRET env var not set and no JWT token provided — bridge will not authenticate with router");
+                return Err("ROUTER_SECRET not available: no JWT token and env var not set".into());
+            }
+        }
     };
 
     if let Some(compose_dir) = &cfg.compose_dir {

@@ -53,6 +53,13 @@ function connectRouter() {
         handleExec(msg);
         return;
       }
+      // Handle scan command — router requests immediate container scan
+      if (msg.type === 'scan') {
+        const compose = require('./compose-manager');
+        const instances = compose.listInstances();
+        routerWs.send(JSON.stringify({ type: 'scan_result', instances }));
+        return;
+      }
       // Handle provision command — create a workspace container
       if (msg.type === 'provision_instance' && msg.instanceId) {
         handleProvision(msg);
@@ -121,14 +128,35 @@ function handleProvision(msg) {
 }
 
 // ── Exec: run commands locally, stream output back to router ──────────────
+const MAX_COMMAND_LENGTH = 10240; // 10KB
+
 function handleExec(msg) {
   const { id, command, cwd, user } = msg;
   const { spawn } = require('child_process');
+
+  // Validate command length
+  if (!command || typeof command !== 'string' || command.length > MAX_COMMAND_LENGTH) {
+    console.warn(`[bridge] exec rejected: invalid command (length=${command?.length || 0})`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid or too long' }));
+    }
+    return;
+  }
+
+  // Validate user field if present (alphanumeric, underscore, dash only)
+  if (user && !/^[a-zA-Z0-9_-]+$/.test(user)) {
+    console.warn(`[bridge] exec rejected: invalid user field`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid user' }));
+    }
+    return;
+  }
+
   const args = user
     ? ['sudo', ['-u', user, 'bash', '-c', command], { cwd: cwd || '/tmp' }]
     : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
 
-  console.log(`[bridge] exec: ${command.slice(0, 80)}`);
+  console.log(`[bridge] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
   const child = spawn(args[0], args[1], { ...args[2], env: { ...process.env, HOME: `/home/${user || 'root'}` } });
 
   let stdout = '';

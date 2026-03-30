@@ -35,30 +35,41 @@ function composeFilePath(chatId) {
   return path.join(COMPOSE_DIR, `docker-compose-${chatId.replace(/[^a-zA-Z0-9_-]/g, '')}.yml`);
 }
 
+/** Escape a value for safe inclusion in a YAML double-quoted string. */
+function yamlEscape(val) {
+  const str = String(val);
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+}
+
 function writeComposeFile(chatId) {
   const services = getUserServices(chatId);
   fs.mkdirSync(COMPOSE_DIR, { recursive: true });
   let yaml = 'services:\n';
   for (const [name, config] of services) {
     yaml += `  ${name}:\n`;
-    yaml += `    image: ${config.image || WORKSPACE_IMAGE}\n`;
-    yaml += `    container_name: ${name}\n`;
+    yaml += `    image: "${yamlEscape(config.image || WORKSPACE_IMAGE)}"\n`;
+    yaml += `    container_name: "${yamlEscape(name)}"\n`;
     yaml += `    restart: unless-stopped\n`;
     if (config.env && Object.keys(config.env).length > 0) {
       yaml += '    environment:\n';
-      for (const [k, v] of Object.entries(config.env)) yaml += `      - "${k}=${v}"\n`;
+      for (const [k, v] of Object.entries(config.env)) yaml += `      - "${yamlEscape(k)}=${yamlEscape(v)}"\n`;
     }
     if (config.ports && config.ports.length > 0) {
       yaml += '    ports:\n';
-      for (const p of config.ports) yaml += `      - "${p}"\n`;
+      for (const p of config.ports) yaml += `      - "${yamlEscape(p)}"\n`;
     }
     if (config.volumes && config.volumes.length > 0) {
       yaml += '    volumes:\n';
-      for (const v of config.volumes) yaml += `      - ${v}\n`;
+      for (const v of config.volumes) yaml += `      - "${yamlEscape(v)}"\n`;
     }
     yaml += '\n';
   }
-  yaml += `networks:\n  default:\n    name: ${NETWORK_NAME}\n    external: true\n`;
+  yaml += `networks:\n  default:\n    name: "${yamlEscape(NETWORK_NAME)}"\n    external: true\n`;
   const filePath = composeFilePath(chatId);
   fs.writeFileSync(filePath, yaml);
 }

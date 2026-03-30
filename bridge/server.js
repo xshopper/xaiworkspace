@@ -135,6 +135,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/pairing-code') {
+    // Validate x-router-secret if present (backward-compatible: allow if absent but warn)
+    const secret = req.headers['x-router-secret'];
+    if (secret && secret !== ROUTER_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    if (!secret) {
+      console.warn('[pairing] /pairing-code accessed without x-router-secret header');
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ code: pairingCode, url: pairingUrl, registered }));
     return;
@@ -273,12 +283,15 @@ async function scanStack() {
 }
 
 /** Retry registration until successful (router may not be ready on first boot). */
-async function registerWithRetry(maxRetries = 30, delayMs = 5000) {
+async function registerWithRetry(maxRetries = 30, initialDelayMs = 5000) {
+  const maxDelayMs = 60000; // Cap at 60s
+  let delayMs = initialDelayMs;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     await registerBridge();
     if (registered) return;
     console.log(`[pairing] Registration attempt ${attempt}/${maxRetries} failed — retrying in ${delayMs / 1000}s`);
     await new Promise(r => setTimeout(r, delayMs));
+    delayMs = Math.min(delayMs * 2, maxDelayMs); // Exponential backoff, capped at 60s
   }
   console.error('[pairing] Exhausted registration retries');
 }
