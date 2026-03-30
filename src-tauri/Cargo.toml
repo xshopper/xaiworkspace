@@ -1,5 +1,5 @@
 [package]
-name = "xaiworkspace-tauri"
+name = "xaiworkspace"
 version = "0.1.0"
 edition = "2021"
 description = "xAI Workspace desktop bootstrapper — installs Docker, runs bridge, handles OAuth"

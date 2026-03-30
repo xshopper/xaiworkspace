@@ -1,5 +1,5 @@
 {
-  "name": "xaiworkspace-tauri",
+  "name": "xaiworkspace",
   "version": "0.1.0",
   "private": true,
   "description": "xAI Workspace desktop app — installs Docker, runs bridge, handles OAuth",
