@@ -1,11 +1,11 @@
 {
-  "bridgeImage": "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-test",
+  "bridgeImage": "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-v0.1.0",
   "bridgePorts": [3100, 54545, 8085, 1455],
   "oauthProviders": [
     { "name": "claude", "port": 54545 },
     { "name": "gemini", "port": 8085 },
     { "name": "codex", "port": 1455 }
   ],
-  "routerUrl": "https://router-test.xaiworkspace.com",
-  "appUrl": "https://app-test.xaiworkspace.com"
+  "routerUrl": "https://router.xaiworkspace.com",
+  "appUrl": "https://xaiworkspace.com"
 }

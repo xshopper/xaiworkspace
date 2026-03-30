@@ -12,26 +12,41 @@ const http = require('http');
 const { execFile } = require('child_process');
 const compose = require('./compose-manager');
 
-const ROUTER_URL = process.env.ROUTER_URL || 'https://router.xaiworkspace.com';
-let ROUTER_SECRET = process.env.ROUTER_SECRET || '';
+const ROUTER_URL = process.env.ROUTER_URL;
+if (!ROUTER_URL) {
+  console.error('[config] FATAL: ROUTER_URL env var is required (prevents silent fallback to production)');
+  process.exit(1);
+}
+const ROUTER_SECRET = process.env.ROUTER_SECRET || '';
+if (!ROUTER_SECRET) {
+  console.warn('[config] WARNING: ROUTER_SECRET env var not set — bridge will not authenticate with router');
+}
 const INSTANCE_ID = process.env.INSTANCE_ID || `xaiw-bridge-${require('crypto').randomBytes(8).toString('hex')}`;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
-let APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
+const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
 
-/** Fetch config from router (includes routerSecret). */
+// Allowed CORS origins — restrict to known app URLs and localhost for dev
+const ALLOWED_ORIGINS = new Set([
+  APP_URL,
+  ROUTER_URL,
+  'http://localhost:4200',
+  'http://localhost:3000',
+  'https://xaiworkspace.com',
+  'https://app-test.xaiworkspace.com',
+]);
+
+/** Fetch non-sensitive config from router (app URL, etc). Never fetch secrets over unauthenticated endpoints. */
 async function fetchRouterConfig() {
   try {
     const url = new URL('/api/config/desktop', ROUTER_URL);
     const resp = await fetch(url.toString(), { signal: AbortSignal.timeout(5000) });
     if (!resp.ok) return;
     const cfg = await resp.json();
-    if (cfg.routerSecret && !ROUTER_SECRET) {
-      ROUTER_SECRET = cfg.routerSecret;
-      console.log('[config] Fetched router secret from config endpoint');
-    }
-    if (cfg.appUrl && APP_URL === 'https://xaiworkspace.com') {
-      APP_URL = cfg.appUrl;
+    // NOTE: routerSecret is intentionally NOT fetched here — it must be provided via
+    // ROUTER_SECRET env var or the authenticated /api/config/provision endpoint.
+    if (cfg.routerSecret) {
+      console.warn('[config] Desktop config endpoint is exposing routerSecret — this should be removed from the router API');
     }
   } catch (err) {
     console.warn('[config] Failed to fetch router config:', err.message);
@@ -119,8 +134,12 @@ function parseBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const origin = req.headers.origin || '';
   const cors = () => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (ALLOWED_ORIGINS.has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-router-secret');
   };
@@ -135,15 +154,15 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/pairing-code') {
-    // Validate x-router-secret if present (backward-compatible: allow if absent but warn)
+    // Require x-router-secret for pairing code access (internal bridge-to-desktop only)
     const secret = req.headers['x-router-secret'];
-    if (secret && secret !== ROUTER_SECRET) {
+    if (!ROUTER_SECRET) {
+      // Secret not configured — allow local access (dev mode) but warn
+      console.warn('[pairing] /pairing-code served without auth (ROUTER_SECRET not configured)');
+    } else if (secret !== ROUTER_SECRET) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
-    }
-    if (!secret) {
-      console.warn('[pairing] /pairing-code accessed without x-router-secret header');
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ code: pairingCode, url: pairingUrl, registered }));
@@ -282,18 +301,46 @@ async function scanStack() {
   }
 }
 
-/** Retry registration until successful (router may not be ready on first boot). */
-async function registerWithRetry(maxRetries = 30, initialDelayMs = 5000) {
-  const maxDelayMs = 60000; // Cap at 60s
+/** Retry registration until successful (router may not be ready on first boot).
+ *  After exhausting retries, enters a slow-poll mode (every 5 min) instead of giving up. */
+async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
+  const maxDelayMs = 60000;
   let delayMs = initialDelayMs;
+  let consecutiveNetworkErrors = 0;
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     await registerBridge();
-    if (registered) return;
+    if (registered) {
+      console.log(`[pairing] Registered successfully on attempt ${attempt}`);
+      return;
+    }
+
+    consecutiveNetworkErrors++;
+    // If we get 5+ consecutive failures with same delay ceiling, the router is likely
+    // unreachable (wrong URL, DNS failure) — warn loudly
+    if (consecutiveNetworkErrors >= 5 && delayMs >= maxDelayMs) {
+      console.error(`[pairing] Router appears unreachable after ${consecutiveNetworkErrors} consecutive failures — check ROUTER_URL (${ROUTER_URL})`);
+    }
+
     console.log(`[pairing] Registration attempt ${attempt}/${maxRetries} failed — retrying in ${delayMs / 1000}s`);
     await new Promise(r => setTimeout(r, delayMs));
-    delayMs = Math.min(delayMs * 2, maxDelayMs); // Exponential backoff, capped at 60s
+    delayMs = Math.min(delayMs * 2, maxDelayMs);
   }
-  console.error('[pairing] Exhausted registration retries');
+
+  console.error(`[pairing] Exhausted ${maxRetries} fast retries — entering slow-poll mode (every 5 min)`);
+
+  // Slow-poll: keep trying indefinitely at 5-minute intervals
+  const slowPollMs = 300000;
+  const slowPoll = async () => {
+    if (registered) return;
+    await registerBridge();
+    if (registered) {
+      console.log('[pairing] Registered successfully via slow-poll');
+      return;
+    }
+    setTimeout(slowPoll, slowPollMs);
+  };
+  setTimeout(slowPoll, slowPollMs);
 }
 
 server.listen(PORT, '0.0.0.0', () => {

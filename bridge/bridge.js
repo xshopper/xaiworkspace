@@ -85,23 +85,56 @@ function connectRouter() {
 }
 
 // ── Provision: create a workspace container via Docker ────────────────────
+
+// Validate env var key/value: keys must be alphanumeric/underscore, values must not contain control chars
+const ENV_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const ENV_VAL_FORBIDDEN_RE = /[\x00-\x08\x0e-\x1f\x7f]/; // control chars except \t \n \r
+
 function handleProvision(msg) {
   const { instanceId, image, env } = msg;
   const { execFileSync } = require('child_process');
 
-  console.log(`[bridge] Provisioning workspace: ${instanceId} (image: ${image})`);
+  // Validate instanceId (alphanumeric, dash, underscore only)
+  if (!instanceId || !/^[a-zA-Z0-9_-]+$/.test(instanceId)) {
+    console.warn(`[bridge] Provision rejected: invalid instanceId: ${instanceId}`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Invalid instanceId' }));
+    }
+    return;
+  }
+
+  // Validate image name (basic Docker image ref format)
+  const safeImage = image || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest';
+  if (!/^[a-zA-Z0-9_./:@-]+$/.test(safeImage)) {
+    console.warn(`[bridge] Provision rejected: invalid image name: ${safeImage}`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Invalid image name' }));
+    }
+    return;
+  }
+
+  console.log(`[bridge] Provisioning workspace: ${instanceId} (image: ${safeImage})`);
 
   try {
     const args = ['run', '-d', '--name', instanceId, '--restart', 'unless-stopped'];
 
-    // Pass environment variables
+    // Pass environment variables with validation
     if (env) {
       for (const [k, v] of Object.entries(env)) {
-        args.push('-e', `${k}=${v}`);
+        if (!ENV_KEY_RE.test(k)) {
+          console.warn(`[bridge] Provision: skipping invalid env key: ${k}`);
+          continue;
+        }
+        const val = String(v);
+        if (ENV_VAL_FORBIDDEN_RE.test(val)) {
+          console.warn(`[bridge] Provision: skipping env ${k} with forbidden control chars`);
+          continue;
+        }
+        args.push('-e', `${k}=${val}`);
       }
     }
 
-    args.push(image || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest');
+    args.push(safeImage);
 
     execFileSync('docker', args, { timeout: 60_000 });
     console.log(`[bridge] Workspace ${instanceId} started`);
@@ -130,6 +163,30 @@ function handleProvision(msg) {
 // ── Exec: run commands locally, stream output back to router ──────────────
 const MAX_COMMAND_LENGTH = 10240; // 10KB
 
+// Allowlisted command prefixes — only these commands can be executed via the router.
+// The bridge has Docker socket access, so this limits the blast radius of a compromised router.
+const EXEC_ALLOWLIST = [
+  'docker ',
+  'docker-compose ',
+  'docker compose ',
+  'pm2 ',
+  'curl ',
+  'cat /data/',
+  'ls ',
+  'echo ',
+  'whoami',
+  'hostname',
+  'uname ',
+  'df ',
+  'free ',
+  'ps ',
+];
+
+function isCommandAllowed(command) {
+  const trimmed = command.trimStart();
+  return EXEC_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
+}
+
 function handleExec(msg) {
   const { id, command, cwd, user } = msg;
   const { spawn } = require('child_process');
@@ -143,11 +200,29 @@ function handleExec(msg) {
     return;
   }
 
+  // Validate command against allowlist
+  if (!isCommandAllowed(command)) {
+    console.warn(`[bridge] exec rejected: command not in allowlist: ${command.slice(0, 80)}`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: not in allowlist' }));
+    }
+    return;
+  }
+
   // Validate user field if present (alphanumeric, underscore, dash only)
   if (user && !/^[a-zA-Z0-9_-]+$/.test(user)) {
     console.warn(`[bridge] exec rejected: invalid user field`);
     if (routerWs?.readyState === WebSocket.OPEN) {
       routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid user' }));
+    }
+    return;
+  }
+
+  // Validate cwd if present (prevent path traversal)
+  if (cwd && (cwd.includes('..') || !cwd.startsWith('/'))) {
+    console.warn(`[bridge] exec rejected: invalid cwd: ${cwd}`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid cwd' }));
     }
     return;
   }

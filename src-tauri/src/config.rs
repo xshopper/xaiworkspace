@@ -30,7 +30,7 @@ pub struct OAuthProvider {
 impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
-            bridge_image: "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest".into(),
+            bridge_image: "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-v0.1.0".into(),
             bridge_ports: vec![3100, 54545, 8085, 1455],
             oauth_providers: vec![
                 OAuthProvider { name: "claude".into(), port: 54545 },
