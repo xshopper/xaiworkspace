@@ -118,7 +118,9 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
         include_bytes!("../icons/tray-icon-light.png")
     };
     let icon = tauri::image::Image::from_bytes(icon_bytes)
-        .expect("Failed to load tray icon");
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("Failed to load tray icon: {e}").into()
+        })?;
 
     TrayIconBuilder::new()
         .icon(icon)
@@ -135,7 +137,8 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
                     app.exit(0);
                 }
                 _ if id.starts_with("oauth_") => {
-                    let provider = id.strip_prefix("oauth_").unwrap().to_string();
+                    let Some(stripped) = id.strip_prefix("oauth_") else { return; };
+                    let provider = stripped.to_string();
                     let mgr = oauth_mgr.clone();
                     let items = items_ref.clone();
                     tauri::async_runtime::spawn(async move {

@@ -110,6 +110,10 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
         }
     };
 
+    if router_secret.len() < 32 {
+        return Err("ROUTER_SECRET must be at least 32 characters".into());
+    }
+
     if let Some(compose_dir) = &cfg.compose_dir {
         // Compose mode: resolve Docker network, run on the same network as the stack
         let network = Command::new("docker")

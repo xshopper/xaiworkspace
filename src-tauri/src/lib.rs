@@ -128,6 +128,17 @@ struct ProvisionParams {
     image: Option<String>,
 }
 
+/// Check if a URL belongs to an allowed domain.
+fn is_allowed_url(url: &str) -> bool {
+    let allowed = ["xaiworkspace.com", "xshopper.com", "localhost", "127.0.0.1"];
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            return allowed.iter().any(|a| host == *a || host.ends_with(&format!(".{}", a)));
+        }
+    }
+    false
+}
+
 /// Parse deep link URL and extract provision parameters.
 /// Format: xaiworkspace://provision?router=URL&app=URL&token=JWT&image=IMAGE
 fn parse_deep_link(url: &str) -> Option<ProvisionParams> {
@@ -147,6 +158,17 @@ fn parse_deep_link(url: &str) -> Option<ProvisionParams> {
         .find(|(k, _)| k == "app")
         .map(|(_, v)| v.to_string())
         .unwrap_or_else(|| "https://xaiworkspace.com".to_string());
+
+    // Validate URLs against allowed domains
+    if !is_allowed_url(&router_url) {
+        eprintln!("[deep-link] Rejected router URL with disallowed domain: {router_url}");
+        return None;
+    }
+    if !is_allowed_url(&app_url) {
+        eprintln!("[deep-link] Rejected app URL with disallowed domain: {app_url}");
+        return None;
+    }
+
     let token = parsed.query_pairs()
         .find(|(k, _)| k == "token")
         .map(|(_, v)| v.to_string())

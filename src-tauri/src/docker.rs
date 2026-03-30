@@ -110,7 +110,10 @@ async fn install_windows() -> Result<(), String> {
         .args(["--status"])
         .output();
 
-    if wsl_check.is_err() || !wsl_check.unwrap().status.success() {
+    let wsl_available = wsl_check
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !wsl_available {
         // Install WSL2 — this may require a reboot
         Command::new("wsl")
             .args(["--install", "--no-distribution"])
