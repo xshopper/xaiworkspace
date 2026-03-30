@@ -209,6 +209,16 @@ function handleExec(msg) {
     return;
   }
 
+  // Block shell metacharacters that enable command injection (semicolons, backticks).
+  // Note: curly braces are intentionally allowed for docker --format '{{.Names}}' patterns.
+  if (/[;`]/.test(command)) {
+    console.warn(`[bridge] exec rejected: disallowed shell characters: ${command.slice(0, 80)}`);
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' }));
+    }
+    return;
+  }
+
   // Validate user field if present (alphanumeric, underscore, dash only)
   if (user && !/^[a-zA-Z0-9_-]+$/.test(user)) {
     console.warn(`[bridge] exec rejected: invalid user field`);
@@ -248,18 +258,19 @@ function handleExec(msg) {
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
   child.on('close', (code) => {
+    clearTimeout(execTimeout);
     if (routerWs?.readyState === WebSocket.OPEN) {
       routerWs.send(JSON.stringify({ type: 'exec_result', id, code, stdout, stderr }));
     }
   });
 
   // Timeout: kill after 5 minutes
-  setTimeout(() => {
+  const execTimeout = setTimeout(() => {
     try { child.kill(); } catch {}
     if (routerWs?.readyState === WebSocket.OPEN) {
       routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout, stderr: stderr + '\nTimeout (300s)' }));
     }
-  }, 300000);
+  }, 300_000);
 }
 
 // ── Graceful shutdown ──────────────────────────────────────────────────────

@@ -114,7 +114,26 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
         return Err("ROUTER_SECRET must be at least 32 characters".into());
     }
 
-    if let Some(compose_dir) = &cfg.compose_dir {
+    // Write the router secret to a temporary file and mount it into the container
+    // as /run/secrets/router_secret. This avoids exposing the secret via `docker inspect`
+    // (which shows all -e env vars in cleartext).
+    let secret_dir = std::env::temp_dir().join(format!("xaiw-bridge-secret-{}", &name));
+    std::fs::create_dir_all(&secret_dir)
+        .map_err(|e| format!("Failed to create secret dir: {e}"))?;
+    let secret_path = secret_dir.join("router_secret");
+    std::fs::write(&secret_path, &router_secret)
+        .map_err(|e| format!("Failed to write secret file: {e}"))?;
+
+    // Restrict file permissions to owner-only (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let secret_mount = format!("{}:/run/secrets/router_secret:ro", secret_path.display());
+
+    let container_result = if let Some(compose_dir) = &cfg.compose_dir {
         // Compose mode: resolve Docker network, run on the same network as the stack
         let network = Command::new("docker")
             .args(["compose", "config", "--format", "json"])
@@ -135,18 +154,16 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "--network", &network,
                 "--restart", "unless-stopped",
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                "-v", &secret_mount,
                 "-e", &format!("INSTANCE_ID={name}"),
                 "-e", &format!("ROUTER_URL={router_url}"),
                 "-e", &format!("APP_URL={app_url}"),
-                "-e", &format!("ROUTER_SECRET={router_secret}"),
                 image,
             ])
             .status()
             .map_err(|e| format!("Failed to create bridge: {e}"))?;
 
-        if !status.success() {
-            return Err("Failed to create bridge container".into());
-        }
+        status
     } else {
         // Standalone mode (production): pull image if needed, run with port mapping
         let image_exists = Command::new("docker")
@@ -161,6 +178,8 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 .status()
                 .map_err(|e| format!("Failed to pull image: {e}"))?;
             if !pull.success() {
+                // Clean up secret file before returning
+                let _ = std::fs::remove_dir_all(&secret_dir);
                 return Err("Failed to pull bridge image".into());
             }
         }
@@ -171,6 +190,7 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "--name", &name,
                 "--restart", "unless-stopped",
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                "-v", &secret_mount,
                 "-p", "3100:3100",     // Pairing server
                 "-p", "54545:54545",   // Claude OAuth callback
                 "-p", "8085:8085",     // Gemini OAuth callback
@@ -178,15 +198,22 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "-e", &format!("INSTANCE_ID={name}"),
                 "-e", &format!("ROUTER_URL={router_url}"),
                 "-e", &format!("APP_URL={app_url}"),
-                "-e", &format!("ROUTER_SECRET={router_secret}"),
                 image,
             ])
             .status()
             .map_err(|e| format!("Failed to create bridge: {e}"))?;
 
-        if !status.success() {
-            return Err("Failed to create bridge container".into());
-        }
+        status
+    };
+
+    // Note: the secret file must persist on the host while the container is running,
+    // because Docker bind mounts are live filesystem references. The file has 0600
+    // permissions, making it accessible only to the current user — significantly more
+    // secure than `-e` env vars which are visible to anyone with Docker socket access
+    // via `docker inspect`.
+
+    if !container_result.success() {
+        return Err("Failed to create bridge container".into());
     }
 
     wait_for_pairing(&name, app_url).await

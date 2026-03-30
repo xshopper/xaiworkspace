@@ -131,12 +131,50 @@ function sendProgress(id, slug, stage, percent) {
   send({ type: 'install_progress', id, slug, stage, percent });
 }
 
+// ── URL validation for app installs ─────────────────────────────────────────
+// Only download artifacts and clone source from trusted domains to prevent
+// a compromised router from directing the workspace to fetch malicious payloads.
+const TRUSTED_DOMAINS = new Set([
+  'github.com',
+  'api.github.com',
+  'codeload.github.com',
+  'raw.githubusercontent.com',
+  'registry.npmjs.org',
+  'xaiworkspace.com',
+  'router.xaiworkspace.com',
+]);
+
+function isUrlTrusted(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    return TRUSTED_DOMAINS.has(parsed.hostname)
+      || [...TRUSTED_DOMAINS].some(d => parsed.hostname.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
 // ── install_app ─────────────────────────────────────────────────────────────
 async function handleInstallApp(msg) {
   const { id, slug, identifier, artifactUrl, sourceUrl, env, manifest } = msg;
   const appDir = path.join(APPS_DIR, identifier || `com.xshopper.${slug}`);
 
   console.log(`[bootstrap] Installing app: ${slug} -> ${appDir}`);
+
+  // Validate download URLs against the trusted domain allowlist before proceeding
+  if (artifactUrl && !isUrlTrusted(artifactUrl)) {
+    const domain = (() => { try { return new URL(artifactUrl).hostname; } catch { return 'invalid'; } })();
+    console.error(`[bootstrap] Install rejected for ${slug}: untrusted artifact URL domain: ${domain}`);
+    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted artifact URL domain: ${domain}` });
+    return;
+  }
+  if (sourceUrl && !isUrlTrusted(sourceUrl)) {
+    const domain = (() => { try { return new URL(sourceUrl).hostname; } catch { return 'invalid'; } })();
+    console.error(`[bootstrap] Install rejected for ${slug}: untrusted source URL domain: ${domain}`);
+    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted source URL domain: ${domain}` });
+    return;
+  }
 
   try {
     // 1. Write env vars to secrets.env
@@ -276,10 +314,68 @@ function handleListApps(msg) {
 }
 
 // ── exec ────────────────────────────────────────────────────────────────────
+const MAX_COMMAND_LENGTH = 10240; // 10KB
+
+// Allowlisted command prefixes — only these commands can be executed via the router.
+// The workspace container runs user workloads, so this limits what the router can invoke.
+const EXEC_ALLOWLIST = [
+  'node ',
+  'pm2 ',
+  'bash scripts/',
+  'bash ./scripts/',
+  'cat ',
+  'ls ',
+  'echo ',
+  'whoami',
+  'hostname',
+  'uname ',
+  'df ',
+  'free ',
+  'ps ',
+  'npm ',
+  'npx ',
+  'curl ',
+  'tail ',
+  'head ',
+  'grep ',
+  'wc ',
+];
+
+function isCommandAllowed(command) {
+  const trimmed = command.trimStart();
+  return EXEC_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
+}
+
 function handleExec(msg) {
   const { id, command, cwd, user } = msg;
-  if (!command || typeof command !== 'string' || command.length > 10240) {
-    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Invalid command' });
+  if (!command || typeof command !== 'string' || command.length > MAX_COMMAND_LENGTH) {
+    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid or too long' });
+    return;
+  }
+
+  // Validate command against allowlist
+  if (!isCommandAllowed(command)) {
+    console.warn(`[bootstrap] exec rejected: command not in allowlist: ${command.slice(0, 80)}`);
+    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: not in allowlist' });
+    return;
+  }
+
+  // Block shell metacharacters that enable command injection (semicolons, backticks)
+  if (/[;`]/.test(command)) {
+    console.warn(`[bootstrap] exec rejected: disallowed shell characters`);
+    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' });
+    return;
+  }
+
+  // Validate user field if present (alphanumeric, underscore, dash only)
+  if (user && !/^[a-zA-Z0-9_-]+$/.test(user)) {
+    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid user' });
+    return;
+  }
+
+  // Validate cwd if present (prevent path traversal)
+  if (cwd && (cwd.includes('..') || !cwd.startsWith('/'))) {
+    send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid cwd' });
     return;
   }
 
@@ -288,13 +384,23 @@ function handleExec(msg) {
     ? ['sudo', ['-u', user, 'bash', '-c', command], { cwd: cwd || '/tmp' }]
     : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
 
+  console.log(`[bootstrap] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
   const child = spawn(args[0], args[1], { ...args[2], env: { ...process.env, HOME: `/home/${user || 'workspace'}` } });
   let stdout = '', stderr = '';
+
   child.stdout.on('data', d => { stdout += d; });
   child.stderr.on('data', d => { stderr += d; });
+
   child.on('close', code => {
+    clearTimeout(execTimeout);
     send({ type: 'exec_result', id, code, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) });
   });
+
+  // Timeout: kill after 5 minutes
+  const execTimeout = setTimeout(() => {
+    try { child.kill(); } catch {}
+    send({ type: 'exec_result', id, code: -1, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) + '\nTimeout (300s)' });
+  }, 300_000);
 }
 
 // ── scan (report installed apps) ────────────────────────────────────────────

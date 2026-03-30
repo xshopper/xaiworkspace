@@ -9,6 +9,7 @@
  * 4. Prints the pairing code + URL to stdout (for headless servers)
  */
 const http = require('http');
+const fs = require('fs');
 const { execFile } = require('child_process');
 const compose = require('./compose-manager');
 
@@ -17,9 +18,17 @@ if (!ROUTER_URL) {
   console.error('[config] FATAL: ROUTER_URL env var is required (prevents silent fallback to production)');
   process.exit(1);
 }
-const ROUTER_SECRET = process.env.ROUTER_SECRET || '';
+// Read router secret from env var first, then fall back to Docker secret file.
+// The Tauri app mounts the secret as a read-only file to avoid exposing it
+// in `docker inspect` output (which shows all -e env vars in cleartext).
+const SECRETS_FILE_PATH = '/run/secrets/router_secret';
+const ROUTER_SECRET = process.env.ROUTER_SECRET
+  || (() => {
+    try { return fs.readFileSync(SECRETS_FILE_PATH, 'utf8').trim(); }
+    catch { return ''; }
+  })();
 if (!ROUTER_SECRET) {
-  console.warn('[config] WARNING: ROUTER_SECRET env var not set — bridge will not authenticate with router');
+  console.warn('[config] WARNING: ROUTER_SECRET not set (checked env var and /run/secrets/router_secret)');
 }
 const INSTANCE_ID = process.env.INSTANCE_ID || `xaiw-bridge-${require('crypto').randomBytes(8).toString('hex')}`;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
@@ -88,7 +97,6 @@ async function registerBridge() {
 
     // Write bridge credentials so bridge.js can authenticate with the router WS.
     if (data.bridgeToken) {
-      const fs = require('fs');
       const authData = {
         type: 'gateway_auth',
         instanceId: INSTANCE_ID,
