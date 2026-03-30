@@ -62,9 +62,11 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
     }));
 
     // Build config from the deep link parameters
-    let mut cfg = config::DesktopConfig::default();
-    cfg.router_url = router_url;
-    cfg.app_url = app_url;
+    let mut cfg = config::DesktopConfig {
+        router_url,
+        app_url,
+        ..Default::default()
+    };
     if let Some(image) = params.image {
         cfg.bridge_image = image;
     }

@@ -95,14 +95,12 @@ fn load_local_file() -> Option<DesktopConfig> {
 pub async fn load_env(env: &str) -> DesktopConfig {
     // Try local config file: config/dev.json, config/test.json, config/prod.json
     let env_file = format!("config/{env}.json");
-    for dir in [std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())), Some(PathBuf::from("."))] {
-        if let Some(dir) = dir {
-            let path = dir.join(&env_file);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_json::from_str::<DesktopConfig>(&content) {
-                    println!("[config] Loaded {env} config from {}", path.display());
-                    return cfg;
-                }
+    for dir in [std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())), Some(PathBuf::from("."))].into_iter().flatten() {
+        let path = dir.join(&env_file);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<DesktopConfig>(&content) {
+                println!("[config] Loaded {env} config from {}", path.display());
+                return cfg;
             }
         }
     }
