@@ -30,8 +30,8 @@ docker build -f Dockerfile.bridge -t xaiworkspace-bridge:latest .
 |-----------|------|------|
 | `config.rs` | Load config: local file > router API > defaults | `DesktopConfig` struct |
 | `docker.rs` | Detect/install Docker Desktop per platform | `is_available()`, `install()` |
-| `bridge.rs` | Pull image, create/start container, health check | `run()`, `wait_for_health()` |
-| `oauth.rs` | TCP listeners on OAuth callback ports, forward to router | `OAuthManager` with toggle |
+| `bridge.rs` | Pull image, create/start container, health check, mount secrets | `run()`, `wait_for_health()` |
+| `oauth.rs` | TCP listeners on OAuth callback ports, state validation, forward to router | `OAuthManager` with toggle + `pending_states` |
 | `tray.rs` | System tray with OAuth port toggles | `CheckMenuItem` per provider |
 | `lib.rs` | Setup flow orchestration, single instance guard | `run_setup()` |
 
@@ -52,6 +52,8 @@ bridge/
   server.js        # Pairing server (health + redirect) — runs inside Docker
   bridge.js        # WS bridge (router ↔ gateway) — runs inside Docker
   ecosystem.config.js  # pm2 config for both processes
+workspace-base/
+  bridge.js        # Bootstrap bridge for bare workspace containers (install/exec/uninstall)
 config/
   dev.json         # Local dev config (localhost)
   test.json        # Test environment config
@@ -71,9 +73,17 @@ Priority: local file > router API > defaults.
 
 - **Single instance**: `tauri-plugin-single-instance` — second launch focuses existing window
 - **OAuth toggle**: `OAuthManager` uses `CancellationToken` per listener; tray `CheckMenuItem` toggles on/off
+- **OAuth state validation**: Callbacks require a state parameter (min 8 chars, alphanumeric + `-_~.`). States registered by this app are consumed on first use; externally-initiated states are format-validated as defense-in-depth (router does authoritative check)
 - **Port conflict**: Bridge container maps OAuth ports; Tauri listeners silently skip bound ports (EADDRINUSE)
 - **Admin elevation**: macOS `osascript`, Windows `PowerShell RunAs`, Linux `pkexec`/`sudo`
 - **FUSE bypass**: AppImage uses `--appimage-extract-and-run` on GNOME 46+ (no executable double-click)
+
+## Security
+
+- **Secret mounting**: `ROUTER_SECRET` is written to a temp file (0600 perms) and bind-mounted into the container at `/run/secrets/router_secret` instead of passed as `-e` env var. This prevents exposure via `docker inspect`. The bridge `server.js` reads from the secret file with env var fallback.
+- **Exec allowlists**: Both `bridge/bridge.js` and `workspace-base/bridge.js` restrict commands to allowlisted prefixes (e.g. `docker`, `node`, `pm2`, `bash scripts/`). Shell metacharacters (`;`, backticks) are blocked to prevent injection.
+- **Input validation**: User fields must be alphanumeric/dash/underscore. Working directories must be absolute paths without `..`. Commands have a 10KB length limit and 5-minute timeout.
+- **Trusted URL domains**: `workspace-base/bridge.js` only downloads artifacts/source from an allowlist of domains (github.com, registry.npmjs.org, xaiworkspace.com, etc.). Non-HTTPS and unknown domains are rejected.
 
 ## Setup Flow (lib.rs → run_setup)
 
@@ -97,6 +107,8 @@ Runs two pm2 processes:
 - `bridge` (bridge.js) — WebSocket bridge between router and local gateway
 
 Ports mapped: 3100 (pairing), 54545 (Claude OAuth), 8085 (Gemini), 1455 (Codex)
+
+Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind mount from host temp file). `server.js` reads secret file first, falls back to env var.
 
 ## App Icon (X-Dot)
 
