@@ -9,13 +9,21 @@
 //   AUTH_JSON   — JSON string: { type: 'gateway_auth', instanceId, instanceToken }
 // ─────────────────────────────────────────────────────────────────────────────
 const WebSocket = require('ws');
+const fs = require('fs');
 
 // Derive ROUTER_WS from ROUTER_URL if not explicitly set
 const ROUTER = process.env.ROUTER_WS
   || (process.env.ROUTER_URL
     ? process.env.ROUTER_URL.replace(/\/$/, '').replace(/^http/, 'ws') + '/ws/gateway'
     : null);
-const AUTH = JSON.parse(process.env.AUTH_JSON || '{}');
+
+// Read auth credentials: env var first, then /data/auth.json (written by pairing server)
+const AUTH_FILE = '/data/auth.json';
+function loadAuth() {
+  if (process.env.AUTH_JSON) return JSON.parse(process.env.AUTH_JSON);
+  try { return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8')); } catch { return {}; }
+}
+let AUTH = loadAuth();
 
 if (!ROUTER) { console.error('[bridge] ROUTER_WS or ROUTER_URL is required'); process.exit(1); }
 
@@ -27,6 +35,13 @@ let pingInterval = null;
 // ── Router connection ──────────────────────────────────────────────────────
 function connectRouter() {
   if (shuttingDown) return;
+  // Re-read auth file on each reconnect — pairing server may have updated it
+  AUTH = loadAuth();
+  if (!AUTH.instanceId || !AUTH.instanceToken) {
+    console.warn('[bridge] No credentials yet (waiting for pairing server to register)');
+    setTimeout(connectRouter, 5000);
+    return;
+  }
   console.log('[bridge] → ' + ROUTER);
   routerWs = new WebSocket(ROUTER);
 

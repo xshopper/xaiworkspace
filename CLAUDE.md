@@ -106,12 +106,14 @@ Priority: local file > router API > defaults.
 Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest`
 
 Runs two pm2 processes:
-- `pairing-server` (server.js) — health endpoint + pairing code redirect on port 3100
-- `bridge` (bridge.js) — WebSocket bridge between router and local gateway
+- `pairing-server` (server.js) — health endpoint + pairing code redirect on port 3100. Registers bridge with router, writes auth credentials to `/data/auth.json`.
+- `bridge` (bridge.js) — WebSocket bridge between router and local gateway. Reads auth from `AUTH_JSON` env var first, then falls back to `/data/auth.json`. Re-reads credentials on each reconnect attempt so it picks up tokens written by the pairing server. Waits gracefully if no credentials are available yet.
 
 Ports mapped: 3100 (pairing), 54545 (Claude OAuth), 8085 (Gemini), 1455 (Codex)
 
 Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind mount from host temp file). `server.js` reads secret file first, falls back to env var.
+
+**E2E tests**: `bridge-domain-connection.spec.ts` (20 tests, desktop + mobile) — validates bridge connects to real domain (not localhost), authenticates, appears as connected in Settings page.
 
 ## App Icon (X-Dot)
 
