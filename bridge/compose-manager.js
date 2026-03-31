@@ -17,6 +17,27 @@ const NETWORK_NAME = process.env.COMPOSE_NETWORK || 'xai-dev';
 // Per-user compose stacks: Map<chatId, Map<instanceId, config>>
 const userStacks = new Map();
 
+/** Restore userStacks from existing compose files on disk after bridge restart. */
+function init() {
+  try {
+    const files = fs.readdirSync(COMPOSE_DIR).filter(f => f.startsWith('docker-compose-') && f.endsWith('.yml'));
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(COMPOSE_DIR, file), 'utf8');
+      // Parse the chat ID from the filename: docker-compose-{chatId}.yml
+      const chatId = file.replace('docker-compose-', '').replace('.yml', '');
+      // Parse instance names from the YAML services section only (exclude networks/volumes)
+      const services = new Map();
+      const servicesSection = content.split(/^networks:/m)[0] || content;
+      const matches = servicesSection.matchAll(/^  ([a-zA-Z0-9_-]+):\n/gm);
+      for (const m of matches) services.set(m[1], {});
+      if (services.size > 0) userStacks.set(chatId, services);
+    }
+    if (userStacks.size > 0) console.log(`[compose] Restored ${userStacks.size} stacks from disk`);
+  } catch (e) { console.warn('[compose] Failed to restore stacks:', e.message); }
+}
+
+init();
+
 /** Get or create a user's service map. */
 function getUserServices(chatId) {
   if (!userStacks.has(chatId)) userStacks.set(chatId, new Map());

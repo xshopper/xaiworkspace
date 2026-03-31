@@ -65,7 +65,9 @@ function connectRouter() {
         handleProvision(msg);
         return;
       }
-    } catch {}
+    } catch (e) {
+      console.error('[bridge] Message handler error:', e.message);
+    }
   });
 
   routerWs.on('close', (code) => {
@@ -191,49 +193,45 @@ function handleExec(msg) {
   const { id, command, cwd, user } = msg;
   const { spawn } = require('child_process');
 
+  function sendResult(code, stdout, stderr) {
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'exec_result', id, code, stdout, stderr }));
+    }
+  }
+
   // Validate command length
   if (!command || typeof command !== 'string' || command.length > MAX_COMMAND_LENGTH) {
     console.warn(`[bridge] exec rejected: invalid command (length=${command?.length || 0})`);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid or too long' }));
-    }
+    sendResult(-1, '', 'Command rejected: invalid or too long');
     return;
   }
 
   // Validate command against allowlist
   if (!isCommandAllowed(command)) {
     console.warn(`[bridge] exec rejected: command not in allowlist: ${command.slice(0, 80)}`);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: not in allowlist' }));
-    }
+    sendResult(-1, '', 'Command rejected: not in allowlist');
     return;
   }
 
-  // Block shell metacharacters that enable command injection (semicolons, backticks).
+  // Block shell metacharacters that enable command injection.
   // Note: curly braces are intentionally allowed for docker --format '{{.Names}}' patterns.
-  if (/[;`]/.test(command)) {
+  if (/[;`|$()><]/.test(command)) {
     console.warn(`[bridge] exec rejected: disallowed shell characters: ${command.slice(0, 80)}`);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' }));
-    }
+    sendResult(-1, '', 'Command rejected: disallowed characters');
     return;
   }
 
   // Validate user field if present (alphanumeric, underscore, dash only)
   if (user && !/^[a-zA-Z0-9_-]+$/.test(user)) {
     console.warn(`[bridge] exec rejected: invalid user field`);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid user' }));
-    }
+    sendResult(-1, '', 'Command rejected: invalid user');
     return;
   }
 
   // Validate cwd if present (prevent path traversal)
   if (cwd && (cwd.includes('..') || !cwd.startsWith('/'))) {
     console.warn(`[bridge] exec rejected: invalid cwd: ${cwd}`);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: invalid cwd' }));
-    }
+    sendResult(-1, '', 'Command rejected: invalid cwd');
     return;
   }
 
@@ -242,7 +240,7 @@ function handleExec(msg) {
     : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
 
   console.log(`[bridge] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
-  const child = spawn(args[0], args[1], { ...args[2], env: { ...process.env, HOME: `/home/${user || 'root'}` } });
+  const child = spawn(args[0], args[1], { ...args[2], detached: true, env: { ...process.env, HOME: `/home/${user || 'root'}` } });
 
   let stdout = '';
   let stderr = '';
@@ -259,17 +257,18 @@ function handleExec(msg) {
 
   child.on('close', (code) => {
     clearTimeout(execTimeout);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code, stdout, stderr }));
-    }
+    sendResult(code, stdout, stderr);
   });
 
-  // Timeout: kill after 5 minutes
+  // Timeout: kill process group after 5 minutes (negative PID kills entire group)
   const execTimeout = setTimeout(() => {
-    try { child.kill(); } catch {}
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({ type: 'exec_result', id, code: -1, stdout, stderr: stderr + '\nTimeout (300s)' }));
+    // Guard against pid 0/undefined which would kill the bridge's own process group
+    if (child.pid > 0) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    } else {
+      try { child.kill('SIGKILL'); } catch {}
     }
+    sendResult(-1, stdout, stderr + '\nTimeout (300s)');
   }, 300_000);
 }
 

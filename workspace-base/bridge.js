@@ -10,7 +10,9 @@
 //   ROUTER_URL, INSTANCE_ID, INSTANCE_TOKEN, CHAT_ID, PORT, GW_PASSWORD
 // ─────────────────────────────────────────────────────────────────────────────
 const http = require('http');
-const { execSync, execFile } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(require('child_process').exec);
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -33,6 +35,11 @@ const PORT = process.env.PORT || '19001';
 const HEALTH_PORT = parseInt(process.env.BRIDGE_HEALTH_PORT || '19099', 10);
 const HOME = process.env.HOME || '/home/workspace';
 const APPS_DIR = path.join(HOME, 'apps');
+
+// ── Input validation patterns ──────────────────────────────────────────────
+const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
+const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
+const VALID_ENV_KEY = /^[A-Z_][A-Z0-9_]*$/;
 
 if (!INSTANCE_ID || !INSTANCE_TOKEN) {
   console.error('[bootstrap] INSTANCE_ID and INSTANCE_TOKEN are required');
@@ -158,7 +165,26 @@ function isUrlTrusted(url) {
 // ── install_app ─────────────────────────────────────────────────────────────
 async function handleInstallApp(msg) {
   const { id, slug, identifier, artifactUrl, sourceUrl, env, manifest } = msg;
+
+  // Validate slug before use in shell commands or file paths
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+
+  // Validate identifier format to prevent path traversal
+  if (identifier && !SAFE_IDENTIFIER.test(identifier)) {
+    send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid identifier' });
+    return;
+  }
+
   const appDir = path.join(APPS_DIR, identifier || `com.xshopper.${slug}`);
+
+  // Verify resolved path stays within APPS_DIR (defense in depth against path traversal)
+  if (!path.resolve(appDir).startsWith(path.resolve(APPS_DIR))) {
+    send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid identifier' });
+    return;
+  }
 
   console.log(`[bootstrap] Installing app: ${slug} -> ${appDir}`);
 
@@ -178,16 +204,25 @@ async function handleInstallApp(msg) {
 
   try {
     // 1. Write env vars to secrets.env
+    const addedKeys = [];
     if (env && typeof env === 'object') {
       sendProgress(id, slug, 'configuring', 5);
       const secretsPath = SECRETS_FILE;
       let existing = '';
       try { existing = fs.readFileSync(secretsPath, 'utf8'); } catch {}
       for (const [k, v] of Object.entries(env)) {
-        if (!existing.includes(`${k}=`)) {
-          fs.appendFileSync(secretsPath, `${k}=${v}\n`);
+        // Validate env key format (uppercase letters, digits, underscores only)
+        if (!VALID_ENV_KEY.test(k)) {
+          console.warn(`[bootstrap] Skipping invalid env key: ${k}`);
+          continue;
         }
-        process.env[k] = String(v); // also set in current process
+        // Sanitize value: strip newlines and shell metacharacters that could escape the env file
+        const sanitized = String(v).replace(/[\n\r`$\\;|&"']/g, '');
+        if (!existing.includes(`${k}=`)) {
+          fs.appendFileSync(secretsPath, `${k}=${sanitized}\n`);
+          addedKeys.push(k);
+        }
+        process.env[k] = sanitized;
       }
     }
 
@@ -195,13 +230,32 @@ async function handleInstallApp(msg) {
     sendProgress(id, slug, 'downloading', 10);
     fs.mkdirSync(appDir, { recursive: true });
 
+    // Record which env keys this app added so uninstall can clean them up.
+    // Written after mkdirSync so appDir is guaranteed to exist.
+    if (addedKeys.length > 0) {
+      fs.writeFileSync(path.join(appDir, '.env-keys'), addedKeys.join('\n'));
+    }
+
     if (artifactUrl) {
       const tmpFile = `/tmp/app-${slug}.zip`;
-      execSync(`curl -sfL "${artifactUrl}" -o "${tmpFile}"`, { timeout: 60000 });
+      await execAsync(`curl -sfL "${artifactUrl}" -o "${tmpFile}"`, { timeout: 60000 });
+
+      // Verify artifact integrity if SHA-256 hash was provided
+      if (msg.sha256) {
+        const crypto = require('crypto');
+        const fileBuffer = fs.readFileSync(tmpFile);
+        const hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+        if (hash !== msg.sha256) {
+          send({ type: 'install_result', id, slug, status: 'error', error: `Artifact integrity check failed (expected ${msg.sha256.slice(0, 8)}..., got ${hash.slice(0, 8)}...)` });
+          try { fs.unlinkSync(tmpFile); } catch {}
+          return;
+        }
+        console.log(`[bootstrap] Artifact integrity verified: ${hash.slice(0, 8)}...`);
+      }
 
       sendProgress(id, slug, 'extracting', 30);
       const tmpDir = `/tmp/app-${slug}-extract`;
-      execSync(`rm -rf "${tmpDir}" && mkdir -p "${tmpDir}" && unzip -qo "${tmpFile}" -d "${tmpDir}"`, { timeout: 30000 });
+      await execAsync(`rm -rf "${tmpDir}" && mkdir -p "${tmpDir}" && unzip -qo "${tmpFile}" -d "${tmpDir}"`, { timeout: 30000 });
 
       // Find the inner directory (GitHub archives have a root dir)
       const entries = fs.readdirSync(tmpDir);
@@ -209,45 +263,43 @@ async function handleInstallApp(msg) {
         ? path.join(tmpDir, entries[0])
         : tmpDir;
 
-      execSync(`cp -a "${src}/." "${appDir}/"`, { timeout: 15000 });
-      execSync(`rm -rf "${tmpFile}" "${tmpDir}"`);
+      await execAsync(`cp -a "${src}/." "${appDir}/"`, { timeout: 15000 });
+      await execAsync(`rm -rf "${tmpFile}" "${tmpDir}"`);
     } else if (sourceUrl) {
-      execSync(`git clone --depth 1 "${sourceUrl}" "${appDir}" 2>/dev/null || (cd "${appDir}" && git pull)`, { timeout: 120000 });
+      await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}" 2>/dev/null || (cd "${appDir}" && git pull)`, { timeout: 120000 });
     }
 
     // 3. Run install.sh if present
     sendProgress(id, slug, 'installing', 50);
     const installScript = path.join(appDir, 'scripts', 'install.sh');
     if (fs.existsSync(installScript)) {
-      execSync(`bash "${installScript}"`, {
+      await execAsync(`bash "${installScript}"`, {
         cwd: appDir,
         env: { ...process.env, APP_DIR: appDir, HOME },
         timeout: 120000,
-        stdio: 'inherit',
       });
     }
 
     // 4. Install npm deps if package.json exists
     const pkgJson = path.join(appDir, 'package.json');
     if (fs.existsSync(pkgJson) && !fs.existsSync(path.join(appDir, 'node_modules'))) {
-      execSync('npm install --omit=dev --loglevel=error', { cwd: appDir, timeout: 60000 });
+      await execAsync('npm install --omit=dev --loglevel=error', { cwd: appDir, timeout: 60000 });
     }
 
     // 5. Regenerate ecosystem and restart pm2
     sendProgress(id, slug, 'starting', 80);
     const genScript = path.join(appDir, 'scripts', 'generate-ecosystem.sh');
     if (fs.existsSync(genScript)) {
-      execSync(`bash "${genScript}"`, {
+      await execAsync(`bash "${genScript}"`, {
         cwd: appDir,
         env: { ...process.env, APP_DIR: appDir, HOME },
         timeout: 30000,
-        stdio: 'inherit',
       });
     }
 
     const ecoFile = path.join(appDir, 'ecosystem.config.js');
     if (fs.existsSync(ecoFile)) {
-      execSync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000, stdio: 'inherit' });
+      await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 });
     }
 
     sendProgress(id, slug, 'complete', 100);
@@ -262,7 +314,26 @@ async function handleInstallApp(msg) {
 // ── uninstall_app ───────────────────────────────────────────────────────────
 function handleUninstallApp(msg) {
   const { id, slug, identifier } = msg;
+
+  // Validate slug before use in shell commands
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'uninstall_result', id, slug, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+
+  // Validate identifier format
+  if (identifier && !SAFE_IDENTIFIER.test(identifier)) {
+    send({ type: 'uninstall_result', id, slug, status: 'error', error: 'Invalid identifier' });
+    return;
+  }
+
   const appDir = path.join(APPS_DIR, identifier || `com.xshopper.${slug}`);
+
+  // Verify resolved path stays within APPS_DIR
+  if (!path.resolve(appDir).startsWith(path.resolve(APPS_DIR))) {
+    send({ type: 'uninstall_result', id, slug, status: 'error', error: 'Invalid identifier' });
+    return;
+  }
 
   try {
     // Run uninstall.sh if present
@@ -271,12 +342,29 @@ function handleUninstallApp(msg) {
       execSync(`bash "${uninstallScript}"`, { cwd: appDir, timeout: 30000, stdio: 'inherit' });
     }
 
-    // Stop pm2 processes for this app
-    try { execSync(`pm2 delete app-${slug}`, { timeout: 10000 }); } catch {}
-    try { execSync(`pm2 delete ${slug}`, { timeout: 10000 }); } catch {}
+    // Stop pm2 processes for this app (use execFileSync to avoid shell injection)
+    try { execFileSync('pm2', ['delete', `app-${slug}`], { timeout: 10000 }); } catch {}
+    try { execFileSync('pm2', ['delete', slug], { timeout: 10000 }); } catch {}
+
+    // Remove app-specific env vars from secrets.env before deleting the directory
+    try {
+      const envKeysFile = path.join(appDir, '.env-keys');
+      if (fs.existsSync(envKeysFile)) {
+        const keysToRemove = fs.readFileSync(envKeysFile, 'utf8').split('\n').filter(Boolean);
+        if (keysToRemove.length > 0) {
+          const secretsPath = SECRETS_FILE;
+          let secrets = fs.readFileSync(secretsPath, 'utf8');
+          for (const key of keysToRemove) {
+            secrets = secrets.replace(new RegExp(`^${key}=.*\\n?`, 'm'), '');
+            delete process.env[key];
+          }
+          fs.writeFileSync(secretsPath, secrets);
+        }
+      }
+    } catch (e) { console.warn('[bootstrap] Failed to clean env vars:', e.message); }
 
     // Remove app directory
-    execSync(`rm -rf "${appDir}"`, { timeout: 10000 });
+    fs.rmSync(appDir, { recursive: true, force: true });
 
     send({ type: 'uninstall_result', id, slug, status: 'ok' });
     console.log(`[bootstrap] App uninstalled: ${slug}`);
@@ -288,8 +376,20 @@ function handleUninstallApp(msg) {
 // ── restart_app ─────────────────────────────────────────────────────────────
 function handleRestartApp(msg) {
   const { id, slug } = msg;
+
+  // Validate slug before use in shell commands
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'restart_result', id, slug, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+
   try {
-    execSync(`pm2 restart ${slug} || pm2 restart app-${slug}`, { timeout: 10000 });
+    // Use execFileSync to avoid shell injection
+    try {
+      execFileSync('pm2', ['restart', slug], { timeout: 10000 });
+    } catch {
+      execFileSync('pm2', ['restart', `app-${slug}`], { timeout: 10000 });
+    }
     send({ type: 'restart_result', id, slug, status: 'ok' });
   } catch (err) {
     send({ type: 'restart_result', id, slug, status: 'error', error: err.message });
@@ -360,7 +460,9 @@ function handleExec(msg) {
     return;
   }
 
-  // Block shell metacharacters that enable command injection (semicolons, backticks)
+  // Block the most dangerous shell metacharacters (command chaining and backtick substitution).
+  // $(), |, >, < are allowed because the router legitimately uses them in exec commands.
+  // The allowlist above is the primary security layer.
   if (/[;`]/.test(command)) {
     console.warn(`[bootstrap] exec rejected: disallowed shell characters`);
     send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' });
@@ -385,7 +487,7 @@ function handleExec(msg) {
     : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
 
   console.log(`[bootstrap] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
-  const child = spawn(args[0], args[1], { ...args[2], env: { ...process.env, HOME: `/home/${user || 'workspace'}` } });
+  const child = spawn(args[0], args[1], { ...args[2], detached: true, env: { ...process.env, HOME: `/home/${user || 'workspace'}` } });
   let stdout = '', stderr = '';
 
   child.stdout.on('data', d => { stdout += d; });
@@ -396,16 +498,32 @@ function handleExec(msg) {
     send({ type: 'exec_result', id, code, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) });
   });
 
-  // Timeout: kill after 5 minutes
+  // Timeout: kill process group after 5 minutes (negative PID kills entire group)
   const execTimeout = setTimeout(() => {
-    try { child.kill(); } catch {}
+    // Guard against pid 0/undefined which would kill the bridge's own process group
+    if (child.pid > 0) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    } else {
+      try { child.kill('SIGKILL'); } catch {}
+    }
     send({ type: 'exec_result', id, code: -1, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) + '\nTimeout (300s)' });
   }, 300_000);
 }
 
 // ── scan (report installed apps) ────────────────────────────────────────────
 function handleScan() {
-  handleListApps({ id: 'scan' });
+  const apps = [];
+  try {
+    if (fs.existsSync(APPS_DIR)) {
+      for (const entry of fs.readdirSync(APPS_DIR)) {
+        const manifestPath = path.join(APPS_DIR, entry, 'manifest.yml');
+        if (fs.existsSync(manifestPath)) {
+          apps.push({ name: entry, status: 'running', health: 'unknown' });
+        }
+      }
+    }
+  } catch {}
+  send({ type: 'scan_result', instances: apps });
 }
 
 // ── Health endpoint ─────────────────────────────────────────────────────────

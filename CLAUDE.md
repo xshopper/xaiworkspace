@@ -54,6 +54,9 @@ bridge/
   ecosystem.config.js  # pm2 config for both processes
 workspace-base/
   bridge.js        # Bootstrap bridge for bare workspace containers (install/exec/uninstall)
+  entrypoint.sh    # Container entrypoint: writes secrets.env, patches OpenClaw gateway config after install
+bridge/
+  compose-manager.js  # Docker Compose management for workspace containers
 config/
   dev.json         # Local dev config (localhost)
   test.json        # Test environment config
@@ -130,6 +133,17 @@ macOS: Developer ID Application certificate from Apple (xShopper Pty Ltd, Team I
 ## CI/CD
 
 `.github/workflows/build.yml` — triggers on `v*` tags. Builds Linux (.AppImage), macOS (.dmg, signed+notarized), Windows (.msi). Uses `tauri-apps/tauri-action` with Rust cache.
+
+## Workspace Container Startup
+
+`workspace-base/entrypoint.sh` runs on workspace container start:
+1. Writes secrets to `/etc/openclaw/secrets.env` from container env vars
+2. Starts a background script that waits for OpenClaw install to complete (checks for `lastTouchedVersion` in `openclaw.json`)
+3. After install, patches `openclaw.json` with `gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback: true` (required for gateway to start on non-loopback interfaces)
+4. Restarts the gateway process via pm2
+5. Main process starts pm2-runtime with the bootstrap bridge
+
+The OpenClaw gateway requires `controlUi.allowedOrigins` or the fallback flag. Without the patch, the gateway crashes with "non-loopback Control UI requires gateway.controlUi.allowedOrigins".
 
 ## Related Projects
 
