@@ -354,10 +354,10 @@ async function handleInstallApp(msg) {
       });
     }
 
-    // 4. Install npm deps if package.json exists
+    // 4. Install deps if package.json exists (using pnpm)
     const pkgJson = path.join(appDir, 'package.json');
     if (fs.existsSync(pkgJson) && !fs.existsSync(path.join(appDir, 'node_modules'))) {
-      await execAsync('npm install --omit=dev --loglevel=error', { cwd: appDir, timeout: 60000 });
+      await execAsync('pnpm install --prod --reporter=silent', { cwd: appDir, timeout: 120000 });
     }
 
     // 5. Regenerate ecosystem and restart pm2
