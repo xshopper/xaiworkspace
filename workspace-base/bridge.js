@@ -217,6 +217,47 @@ function isUrlTrusted(url) {
   }
 }
 
+// ── Backup / restore helpers ────────────────────────────────────────────────
+const BOOTSTRAP_FILES = ['bridge.js', 'entrypoint.sh', 'ecosystem.config.js', 'package.json'];
+
+function backupDir(srcDir, backupDir) {
+  fs.mkdirSync(backupDir, { recursive: true });
+  for (const f of fs.readdirSync(srcDir)) {
+    const s = path.join(srcDir, f);
+    const d = path.join(backupDir, f);
+    const stat = fs.statSync(s);
+    if (stat.isDirectory()) {
+      backupDir_inner(s, d);
+    } else {
+      fs.copyFileSync(s, d);
+    }
+  }
+}
+
+function backupDir_inner(srcDir, dstDir) {
+  fs.mkdirSync(dstDir, { recursive: true });
+  for (const f of fs.readdirSync(srcDir)) {
+    const s = path.join(srcDir, f);
+    const d = path.join(dstDir, f);
+    if (fs.statSync(s).isDirectory()) backupDir_inner(s, d);
+    else fs.copyFileSync(s, d);
+  }
+}
+
+function restoreDir(backupDir, dstDir) {
+  // Remove everything in dstDir except node_modules (preserve installed deps)
+  for (const f of fs.readdirSync(dstDir)) {
+    if (f === 'node_modules') continue;
+    fs.rmSync(path.join(dstDir, f), { recursive: true, force: true });
+  }
+  for (const f of fs.readdirSync(backupDir)) {
+    const s = path.join(backupDir, f);
+    const d = path.join(dstDir, f);
+    if (fs.statSync(s).isDirectory()) backupDir_inner(s, d);
+    else fs.copyFileSync(s, d);
+  }
+}
+
 // ── Self-update (slug: 'bootstrap') ────────────────────────────────────────
 async function handleSelfUpdate(msg) {
   const { id, version, artifactUrl, sourceUrl, subdir } = msg;
@@ -239,9 +280,41 @@ async function handleSelfUpdate(msg) {
 
   const bootstrapDir = '/opt/bootstrap';
   const tmpDir = `/tmp/bootstrap-update-${Date.now()}`;
+  const backupPath = `/tmp/bootstrap-backup-${Date.now()}`;
+  let backedUp = false;
+
+  // Back up current bootstrap files before touching anything
+  try {
+    fs.mkdirSync(backupPath, { recursive: true });
+    for (const f of BOOTSTRAP_FILES) {
+      const src2 = path.join(bootstrapDir, f);
+      if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(backupPath, f));
+    }
+    backedUp = true;
+    console.log(`[workspace-agent] Bootstrap backed up to ${backupPath}`);
+  } catch (backupErr) {
+    console.error(`[workspace-agent] Backup failed, aborting update:`, backupErr.message);
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Backup failed: ' + backupErr.message });
+    return;
+  }
+
+  const rollback = (reason) => {
+    console.error(`[workspace-agent] Rolling back bootstrap: ${reason}`);
+    try {
+      for (const f of BOOTSTRAP_FILES) {
+        const src2 = path.join(backupPath, f);
+        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
+      }
+      console.log(`[workspace-agent] Bootstrap restored from backup`);
+    } catch (e) {
+      console.error(`[workspace-agent] Rollback copy failed:`, e.message);
+    }
+  };
 
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
+
+    let src = null;
 
     if (artifactUrl) {
       const tmpFile = `${tmpDir}/bootstrap.zip`;
@@ -250,7 +323,7 @@ async function handleSelfUpdate(msg) {
 
       // Find inner directory (GitHub archive root)
       const entries = fs.readdirSync(`${tmpDir}/extract`);
-      let src = entries.length === 1 && fs.statSync(path.join(`${tmpDir}/extract`, entries[0])).isDirectory()
+      src = entries.length === 1 && fs.statSync(path.join(`${tmpDir}/extract`, entries[0])).isDirectory()
         ? path.join(`${tmpDir}/extract`, entries[0])
         : `${tmpDir}/extract`;
 
@@ -258,36 +331,27 @@ async function handleSelfUpdate(msg) {
         const sub = path.join(src, subdir);
         if (fs.existsSync(sub)) src = sub;
       }
-
-      // Only copy bridge.js — preserve node_modules and ecosystem
-      const newBridge = path.join(src, 'bridge.js');
-      if (!fs.existsSync(newBridge)) {
-        send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'bridge.js not found in artifact' });
-        return;
-      }
-      fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
-      // Also copy entrypoint.sh and ecosystem if present
-      for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
-        const src2 = path.join(src, f);
-        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
-      }
     } else if (sourceUrl) {
       await execAsync(`git clone --depth 1 "${sourceUrl}" "${tmpDir}/src"`, { timeout: 120000 });
-      let src = `${tmpDir}/src`;
+      src = `${tmpDir}/src`;
       if (subdir) {
         const sub = path.join(src, subdir);
         if (fs.existsSync(sub)) src = sub;
       }
-      const newBridge = path.join(src, 'bridge.js');
-      if (!fs.existsSync(newBridge)) {
-        send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'bridge.js not found in source' });
-        return;
-      }
-      fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
-      for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
-        const src2 = path.join(src, f);
-        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
-      }
+    }
+
+    if (!src) throw new Error('No artifact or source URL provided');
+
+    const newBridge = path.join(src, 'bridge.js');
+    if (!fs.existsSync(newBridge)) {
+      throw new Error('bridge.js not found in update package');
+    }
+
+    // Copy new files into bootstrap dir
+    fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
+    for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
+      const src2 = path.join(src, f);
+      if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
     }
 
     // Install deps if package.json changed
@@ -301,14 +365,22 @@ async function handleSelfUpdate(msg) {
 
     // Restart via pm2 after a brief delay (let the result message send)
     setTimeout(() => {
-      try { execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 }); }
-      catch { process.exit(0); } // fallback: exit and let pm2 auto-restart
+      try {
+        execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
+      } catch (restartErr) {
+        // pm2 restart failed — restore backup and exit so pm2 auto-restarts old version
+        console.error(`[workspace-agent] pm2 restart failed, restoring backup:`, restartErr.message);
+        rollback('pm2 restart failed');
+        process.exit(0);
+      }
     }, 500);
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
+    if (backedUp) rollback(err.message);
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: err.message });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Keep backup around until pm2 restarts successfully; clean up on next boot via entrypoint
   }
 }
 
@@ -365,6 +437,41 @@ async function handleInstallApp(msg) {
     send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted source URL domain: ${domain}` });
     return;
   }
+
+  // Back up existing installation before touching anything (upgrade path)
+  const isUpgrade = fs.existsSync(appDir);
+  const appBackupPath = `/tmp/app-${slug}-backup-${Date.now()}`;
+  let appBackedUp = false;
+  if (isUpgrade) {
+    try {
+      backupDir(appDir, appBackupPath);
+      appBackedUp = true;
+      console.log(`[workspace-agent] App ${slug} backed up to ${appBackupPath}`);
+    } catch (backupErr) {
+      console.error(`[workspace-agent] Backup failed for ${slug}, aborting upgrade:`, backupErr.message);
+      send({ type: 'install_result', id, slug, status: 'error', error: 'Backup failed: ' + backupErr.message });
+      _installingApps.delete(slug);
+      return;
+    }
+  }
+
+  const rollbackApp = async (reason) => {
+    console.error(`[workspace-agent] Rolling back ${slug}: ${reason}`);
+    try {
+      // Restore files from backup
+      restoreDir(appBackupPath, appDir);
+      console.log(`[workspace-agent] App ${slug} restored from backup`);
+      // Restart the old pm2 process if it was running
+      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      if (fs.existsSync(ecoFile)) {
+        await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 }).catch(() => {});
+      } else {
+        try { execFileSync('pm2', ['restart', slug], { timeout: 10000 }); } catch {}
+      }
+    } catch (e) {
+      console.error(`[workspace-agent] Rollback failed for ${slug}:`, e.message);
+    }
+  };
 
   try {
     // 1. Write env vars to secrets.env
@@ -498,8 +605,17 @@ async function handleInstallApp(msg) {
     sendProgress(id, slug, 'complete', 100);
     send({ type: 'install_result', id, slug, status: 'ok' });
     console.log(`[workspace-agent] App installed: ${slug}`);
+    // Installation succeeded — clean up backup
+    if (appBackedUp) fs.rmSync(appBackupPath, { recursive: true, force: true });
   } catch (err) {
     console.error(`[workspace-agent] Install failed for ${slug}:`, err.message);
+    if (appBackedUp) {
+      await rollbackApp(err.message);
+      fs.rmSync(appBackupPath, { recursive: true, force: true });
+    } else {
+      // Fresh install with no backup — clean up partially-written app dir
+      try { fs.rmSync(appDir, { recursive: true, force: true }); } catch {}
+    }
     send({ type: 'install_result', id, slug, status: 'error', error: err.message });
   } finally {
     _installingApps.delete(slug);

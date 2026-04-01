@@ -49,5 +49,8 @@ mkdir -p "$WORKSPACE_HOME/apps"
   fi
 ) &
 
+# Clean up any leftover update/backup temp dirs from previous runs
+rm -rf /tmp/bootstrap-update-* /tmp/bootstrap-backup-* /tmp/app-*-backup-* 2>/dev/null || true
+
 echo "[entrypoint] Secrets written, starting workspace agent..."
 exec pm2-runtime start /opt/bootstrap/ecosystem.config.js --raw
