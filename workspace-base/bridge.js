@@ -331,6 +331,7 @@ async function handleSelfUpdate(msg) {
     return allOk;
   };
 
+  let tmpDirCleaned = false;
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -369,29 +370,30 @@ async function handleSelfUpdate(msg) {
       if (fs.existsSync(srcFile)) fs.copyFileSync(srcFile, path.join(bootstrapDir, f));
     }
 
-    // Run npm install — if this fails, roll back before reporting error
+    // Run pnpm install — if this fails, roll back before reporting error
     const pkgJson = path.join(bootstrapDir, 'package.json');
     if (fs.existsSync(pkgJson)) {
-      await execAsync('npm install --omit=dev --loglevel=error', { cwd: bootstrapDir, timeout: 60000 });
+      await execAsync('pnpm install --prod --reporter=silent', { cwd: bootstrapDir, timeout: 60000 });
     }
 
     console.log(`[workspace-agent] Self-update staged, restarting...`);
 
-    // Send ok BEFORE pm2 restart — the process is replaced by restart so anything
-    // after execFileSync is unreachable. The router confirms success by seeing the
-    // new agentVersion on the next gateway_auth after reconnect.
-    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
+    // Do NOT send 'ok' before pm2 restart — the process is replaced so anything after
+    // execFileSync is unreachable, and sending ok then error (on restart failure) would
+    // desync the router. The router infers success from the new agentVersion on reconnect.
+    // On failure we send 'error' — exactly one message, either error or nothing.
 
-    // Clean up tmpDir now — finally block won't run after process replacement.
-    // Keep backupPath until after restart attempt in case restart fails and we need to roll back.
+    // Clean up tmpDir — finally block won't run after process replacement.
+    // Keep backupPath until after the restart attempt (needed for rollback on failure).
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDirCleaned = true;
 
-    // Small delay to let the WS send flush before the process is replaced
+    // Small delay to let any in-flight WS sends flush before the process is replaced
     await new Promise(resolve => setTimeout(resolve, 200));
 
     try {
       execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
-      // Unreachable on success — process replaced above. backupPath cleaned by entrypoint on next boot.
+      // Unreachable on success — process is replaced. backupPath cleaned by entrypoint on next boot.
     } catch (restartErr) {
       // pm2 restart failed — files are already updated but process is still running.
       // Roll back files and exit so pm2 auto-restarts with the old version.
@@ -399,19 +401,17 @@ async function handleSelfUpdate(msg) {
       const rolledBackClean = rollback('pm2 restart failed');
       send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'pm2 restart failed: ' + restartErr.message });
       if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
-      // Delay exit so the error message can flush over WS
-      setTimeout(() => process.exit(0), 200);
-      return;
+      // Delay exit so the error message can flush over WS, then let pm2 auto-restart old version
+      await new Promise(resolve => setTimeout(resolve, 200));
+      process.exit(0);
     }
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
     const rolledBackClean = rollback(err.message);
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: err.message });
-    // If rollback was partial, keep the backup for manual recovery (entrypoint cleans on next boot)
     if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
   } finally {
-    // tmpDir always cleaned up; backupPath only cleaned here on clean success/rollback paths
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (!tmpDirCleaned) fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -487,10 +487,10 @@ async function handleInstallApp(msg) {
     try {
       restoreAppDir(appBackupPath, appDir);
       console.log(`[workspace-agent] App ${slug} restored from backup`);
-      // Restart the old pm2 process
+      // Restart the old pm2 process (startOrRestart handles already-running processes)
       const ecoFile = path.join(appDir, 'ecosystem.config.js');
       if (fs.existsSync(ecoFile)) {
-        await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 }).catch(() => {});
+        await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 }).catch(() => {});
       } else {
         try { execFileSync('pm2', ['restart', slug], { timeout: 10000 }); } catch {}
       }
@@ -600,10 +600,22 @@ async function handleInstallApp(msg) {
       });
     }
 
-    // 4. Install deps if package.json exists (using pnpm)
+    // 4. Install deps if package.json exists (using pnpm).
+    // On upgrades, always reinstall if package.json changed — stale node_modules from the
+    // old version may be missing new deps or have incompatible versions.
     const pkgJson = path.join(appDir, 'package.json');
-    if (fs.existsSync(pkgJson) && !fs.existsSync(path.join(appDir, 'node_modules'))) {
-      await execAsync('pnpm install --prod --reporter=silent', { cwd: appDir, timeout: 120000 });
+    if (fs.existsSync(pkgJson)) {
+      const needsInstall = !fs.existsSync(path.join(appDir, 'node_modules'))
+        || (isUpgrade && (() => {
+          try {
+            const oldPkg = path.join(appBackupPath, 'package.json');
+            return !fs.existsSync(oldPkg)
+              || fs.readFileSync(pkgJson, 'utf8') !== fs.readFileSync(oldPkg, 'utf8');
+          } catch { return true; }
+        })());
+      if (needsInstall) {
+        await execAsync('pnpm install --prod --reporter=silent', { cwd: appDir, timeout: 120000 });
+      }
     }
 
     // 5. Regenerate ecosystem and restart pm2
@@ -619,13 +631,13 @@ async function handleInstallApp(msg) {
 
     const ecoFile = path.join(appDir, 'ecosystem.config.js');
     if (fs.existsSync(ecoFile)) {
-      await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 });
+      await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
     } else if (manifest?.startup) {
       // No ecosystem file — generate one from manifest startup command
       const startupCmd = manifest.startup;
       const eco = 'module.exports = { apps: [{ name: ' + JSON.stringify(slug) + ', script: "/bin/bash", args: ["-c", ' + JSON.stringify(startupCmd) + '], cwd: ' + JSON.stringify(appDir) + ', autorestart: true }] };';
       fs.writeFileSync(ecoFile, eco);
-      await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 });
+      await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
       console.log('[bootstrap] Generated ecosystem from manifest.startup for ' + slug);
     }
 
@@ -641,7 +653,7 @@ async function handleInstallApp(msg) {
       try {
         let secrets = fs.readFileSync(SECRETS_FILE, 'utf8');
         for (const k of addedKeys) {
-          secrets = secrets.replace(new RegExp('^' + k + '=.*\\n?', 'm'), '');
+          secrets = secrets.replace(new RegExp('^' + k + '=.*\\n?', 'mg'), '');
           delete process.env[k];
         }
         fs.writeFileSync(SECRETS_FILE, secrets);
@@ -704,7 +716,7 @@ function handleUninstallApp(msg) {
           const secretsPath = SECRETS_FILE;
           let secrets = fs.readFileSync(secretsPath, 'utf8');
           for (const key of keysToRemove) {
-            secrets = secrets.replace(new RegExp(`^${key}=.*\\n?`, 'm'), '');
+            secrets = secrets.replace(new RegExp(`^${key}=.*\\n?`, 'mg'), '');
             delete process.env[key];
           }
           fs.writeFileSync(secretsPath, secrets);
