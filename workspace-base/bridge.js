@@ -219,7 +219,7 @@ function isUrlTrusted(url) {
 
 // Reject URLs whose path/query contains shell metacharacters that could escape
 // the double-quoted shell arguments used in curl/git execAsync calls.
-const SHELL_UNSAFE = /[$`()|;&\n\r\\]/;
+const SHELL_UNSAFE = /[$`"()|;&\n\r\\]/;
 function isUrlShellSafe(url) {
   try {
     const parsed = new URL(url);
@@ -895,13 +895,18 @@ function handleExec(msg) {
   child.stdout.on('data', d => { stdout += d; });
   child.stderr.on('data', d => { stderr += d; });
 
+  let resultSent = false;
   child.on('close', code => {
+    if (resultSent) return;
+    resultSent = true;
     clearTimeout(execTimeout);
     send({ type: 'exec_result', id, code, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) });
   });
 
   // Timeout: kill process group after 5 minutes (negative PID kills entire group)
   const execTimeout = setTimeout(() => {
+    if (resultSent) return;
+    resultSent = true;
     // Guard against pid 0/undefined which would kill the bridge's own process group
     if (child.pid > 0) {
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
