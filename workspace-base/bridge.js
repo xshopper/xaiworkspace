@@ -322,7 +322,12 @@ async function handleSelfUpdate(msg) {
         catch (e) { console.error(`[workspace-agent] Rollback failed to restore ${f}:`, e.message); allOk = false; }
       }
     }
-    if (allOk) console.log(`[workspace-agent] Bootstrap restored from backup`);
+    if (allOk) {
+      console.log(`[workspace-agent] Bootstrap restored from backup`);
+    } else {
+      // Partial rollback — keep backup in place for manual recovery
+      console.error(`[workspace-agent] Partial rollback — backup preserved at ${backupPath}`);
+    }
     return allOk;
   };
 
@@ -372,27 +377,41 @@ async function handleSelfUpdate(msg) {
 
     console.log(`[workspace-agent] Self-update staged, restarting...`);
 
-    // Attempt pm2 restart — if it fails, roll back and report error (do NOT send ok first)
+    // Send ok BEFORE pm2 restart — the process is replaced by restart so anything
+    // after execFileSync is unreachable. The router confirms success by seeing the
+    // new agentVersion on the next gateway_auth after reconnect.
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
+
+    // Clean up tmpDir now — finally block won't run after process replacement.
+    // Keep backupPath until after restart attempt in case restart fails and we need to roll back.
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+
+    // Small delay to let the WS send flush before the process is replaced
+    await new Promise(resolve => setTimeout(resolve, 200));
+
     try {
-      // Flush the WS send queue before restarting by deferring to next tick
-      await new Promise(resolve => setTimeout(resolve, 200));
       execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
-      // If we reach here the process is being replaced — send ok on a best-effort basis
-      send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
+      // Unreachable on success — process replaced above. backupPath cleaned by entrypoint on next boot.
     } catch (restartErr) {
+      // pm2 restart failed — files are already updated but process is still running.
+      // Roll back files and exit so pm2 auto-restarts with the old version.
       console.error(`[workspace-agent] pm2 restart failed, rolling back:`, restartErr.message);
-      rollback('pm2 restart failed');
+      const rolledBackClean = rollback('pm2 restart failed');
       send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'pm2 restart failed: ' + restartErr.message });
-      // Exit so pm2 auto-restarts with the restored old version
+      if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
+      // Delay exit so the error message can flush over WS
       setTimeout(() => process.exit(0), 200);
+      return;
     }
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
-    rollback(err.message);
+    const rolledBackClean = rollback(err.message);
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: err.message });
+    // If rollback was partial, keep the backup for manual recovery (entrypoint cleans on next boot)
+    if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
   } finally {
+    // tmpDir always cleaned up; backupPath only cleaned here on clean success/rollback paths
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    fs.rmSync(backupPath, { recursive: true, force: true });
   }
 }
 
@@ -463,6 +482,7 @@ async function handleInstallApp(msg) {
   }
 
   const rollbackApp = async (reason) => {
+    if (!appBackedUp) return; // no backup exists — nothing to restore
     console.error(`[workspace-agent] Rolling back ${slug}: ${reason}`);
     try {
       restoreAppDir(appBackupPath, appDir);
@@ -479,9 +499,11 @@ async function handleInstallApp(msg) {
     }
   };
 
+  // Track env keys written so they can be rolled back on failure
+  const addedKeys = [];
+
   try {
     // 1. Write env vars to secrets.env
-    const addedKeys = [];
     if (env && typeof env === 'object') {
       sendProgress(id, slug, 'configuring', 5);
       const secretsPath = SECRETS_FILE;
@@ -614,6 +636,17 @@ async function handleInstallApp(msg) {
     if (appBackedUp) fs.rmSync(appBackupPath, { recursive: true, force: true });
   } catch (err) {
     console.error(`[workspace-agent] Install failed for ${slug}:`, err.message);
+    // Roll back env vars that were written to secrets.env for this install
+    if (addedKeys.length > 0) {
+      try {
+        let secrets = fs.readFileSync(SECRETS_FILE, 'utf8');
+        for (const k of addedKeys) {
+          secrets = secrets.replace(new RegExp('^' + k + '=.*\\n?', 'm'), '');
+          delete process.env[k];
+        }
+        fs.writeFileSync(SECRETS_FILE, secrets);
+      } catch (e) { console.warn(`[workspace-agent] Failed to roll back env vars for ${slug}:`, e.message); }
+    }
     if (appBackedUp) {
       await rollbackApp(err.message);
       fs.rmSync(appBackupPath, { recursive: true, force: true });
