@@ -32,14 +32,15 @@ mkdir -p "$WORKSPACE_HOME/apps"
   done
   if [ -f "$OPENCLAW_CONFIG" ]; then
     # Patch gateway.controlUi into the config using node (jq not available)
-    node -e "
+    OPENCLAW_CONFIG="$OPENCLAW_CONFIG" GW_PASSWORD="$GW_PASSWORD" node -e "
       const fs = require('fs');
-      const f = '$OPENCLAW_CONFIG';
+      const f = process.env.OPENCLAW_CONFIG;
       const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
       cfg.gateway = cfg.gateway || {};
       cfg.gateway.controlUi = cfg.gateway.controlUi || {};
       cfg.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
-      if ('${GW_PASSWORD}') cfg.gateway.auth = { mode: 'token', token: '${GW_PASSWORD}' };
+      const pw = process.env.GW_PASSWORD;
+      if (pw) cfg.gateway.auth = { mode: 'token', token: pw };
       fs.writeFileSync(f, JSON.stringify(cfg, null, 2));
       console.log('[entrypoint] Patched openclaw.json with gateway.controlUi');
     " 2>/dev/null
@@ -48,5 +49,5 @@ mkdir -p "$WORKSPACE_HOME/apps"
   fi
 ) &
 
-echo "[entrypoint] Secrets written, starting bootstrap bridge..."
+echo "[entrypoint] Secrets written, starting workspace agent..."
 exec pm2-runtime start /opt/bootstrap/ecosystem.config.js --raw

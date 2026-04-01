@@ -36,6 +36,9 @@ const HEALTH_PORT = parseInt(process.env.BRIDGE_HEALTH_PORT || '19099', 10);
 const HOME = process.env.HOME || '/home/workspace';
 const APPS_DIR = path.join(HOME, 'apps');
 
+// ── Agent version (reported to router; router can trigger self-update) ─────
+const AGENT_VERSION = '1.1.0';
+
 // ── Input validation patterns ──────────────────────────────────────────────
 const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
@@ -48,7 +51,7 @@ if (!INSTANCE_ID || !INSTANCE_TOKEN) {
 
 // Derive WS URL from ROUTER_URL
 const wsUrl = ROUTER_URL.replace(/^http/, 'ws') + '/ws/gateway';
-const auth = { type: 'gateway_auth', instanceId: INSTANCE_ID, instanceToken: INSTANCE_TOKEN, chatId: CHAT_ID, port: parseInt(PORT, 10) };
+const auth = { type: 'gateway_auth', instanceId: INSTANCE_ID, instanceToken: INSTANCE_TOKEN, chatId: CHAT_ID, port: parseInt(PORT, 10), agentVersion: AGENT_VERSION };
 
 let ws = null;
 let authenticated = false;
@@ -214,10 +217,111 @@ function isUrlTrusted(url) {
   }
 }
 
+// ── Self-update (slug: 'bootstrap') ────────────────────────────────────────
+async function handleSelfUpdate(msg) {
+  const { id, version, artifactUrl, sourceUrl, subdir } = msg;
+  if (!version || version === AGENT_VERSION) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok', skipped: true });
+    return;
+  }
+
+  console.log(`[workspace-agent] Self-update: ${AGENT_VERSION} → ${version}`);
+
+  // Validate URL
+  if (artifactUrl && !isUrlTrusted(artifactUrl)) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted URL' });
+    return;
+  }
+  if (sourceUrl && !isUrlTrusted(sourceUrl)) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted URL' });
+    return;
+  }
+
+  const bootstrapDir = '/opt/bootstrap';
+  const tmpDir = `/tmp/bootstrap-update-${Date.now()}`;
+
+  try {
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    if (artifactUrl) {
+      const tmpFile = `${tmpDir}/bootstrap.zip`;
+      await execAsync(`curl -sfL "${artifactUrl}" -o "${tmpFile}"`, { timeout: 60000 });
+      await execAsync(`unzip -qo "${tmpFile}" -d "${tmpDir}/extract"`, { timeout: 30000 });
+
+      // Find inner directory (GitHub archive root)
+      const entries = fs.readdirSync(`${tmpDir}/extract`);
+      let src = entries.length === 1 && fs.statSync(path.join(`${tmpDir}/extract`, entries[0])).isDirectory()
+        ? path.join(`${tmpDir}/extract`, entries[0])
+        : `${tmpDir}/extract`;
+
+      if (subdir) {
+        const sub = path.join(src, subdir);
+        if (fs.existsSync(sub)) src = sub;
+      }
+
+      // Only copy bridge.js — preserve node_modules and ecosystem
+      const newBridge = path.join(src, 'bridge.js');
+      if (!fs.existsSync(newBridge)) {
+        send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'bridge.js not found in artifact' });
+        return;
+      }
+      fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
+      // Also copy entrypoint.sh and ecosystem if present
+      for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
+        const src2 = path.join(src, f);
+        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
+      }
+    } else if (sourceUrl) {
+      await execAsync(`git clone --depth 1 "${sourceUrl}" "${tmpDir}/src"`, { timeout: 120000 });
+      let src = `${tmpDir}/src`;
+      if (subdir) {
+        const sub = path.join(src, subdir);
+        if (fs.existsSync(sub)) src = sub;
+      }
+      const newBridge = path.join(src, 'bridge.js');
+      if (!fs.existsSync(newBridge)) {
+        send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'bridge.js not found in source' });
+        return;
+      }
+      fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
+      for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
+        const src2 = path.join(src, f);
+        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
+      }
+    }
+
+    // Install deps if package.json changed
+    const pkgJson = path.join(bootstrapDir, 'package.json');
+    if (fs.existsSync(pkgJson)) {
+      await execAsync('npm install --omit=dev --loglevel=error', { cwd: bootstrapDir, timeout: 60000 });
+    }
+
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
+    console.log(`[workspace-agent] Self-update complete, restarting...`);
+
+    // Restart via pm2 after a brief delay (let the result message send)
+    setTimeout(() => {
+      try { execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 }); }
+      catch { process.exit(0); } // fallback: exit and let pm2 auto-restart
+    }, 500);
+  } catch (err) {
+    console.error(`[workspace-agent] Self-update failed:`, err.message);
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: err.message });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 // ── install_app ─────────────────────────────────────────────────────────────
 const _installingApps = new Set();
 async function handleInstallApp(msg) {
   const { id, slug, identifier, artifactUrl, sourceUrl, subdir, env, manifest } = msg;
+
+  // Self-update: router sends slug 'bootstrap' to upgrade the workspace agent
+  if (slug === 'bootstrap') {
+    handleSelfUpdate(msg);
+    return;
+  }
 
   // Deduplicate — skip if this slug is already being installed
   if (_installingApps.has(slug)) {

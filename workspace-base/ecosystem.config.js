@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'bootstrap-bridge',
+    name: 'workspace-agent',
     script: '/opt/bootstrap/bridge.js',
     autorestart: true,
     max_restarts: 10,
