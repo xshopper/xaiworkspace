@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// ── Bootstrap Bridge ──────────────────────────────────────────────────────────
-// Minimal WS agent for a bare workspace container. Connects to the router,
+// ── Workspace Agent ──────────────────────────────────────────────────────────
+// Minimal WS agent inside each workspace container. Connects to the router,
 // receives install/exec/uninstall commands, and executes them locally.
 //
 // Once the openclaw mini-app is installed and its own bridge.js starts, this
-// bridge goes dormant (the router closes the duplicate connection).
+// agent goes dormant (the router closes the duplicate connection).
 //
 // Environment (from /etc/openclaw/secrets.env):
 //   ROUTER_URL, INSTANCE_ID, INSTANCE_TOKEN, CHAT_ID, PORT, GW_PASSWORD
@@ -42,7 +42,7 @@ const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
 const VALID_ENV_KEY = /^[A-Z_][A-Z0-9_]*$/;
 
 if (!INSTANCE_ID || !INSTANCE_TOKEN) {
-  console.error('[bootstrap] INSTANCE_ID and INSTANCE_TOKEN are required');
+  console.error('[workspace-agent] INSTANCE_ID and INSTANCE_TOKEN are required');
   process.exit(1);
 }
 
@@ -71,16 +71,16 @@ function connect() {
 
   // Don't reconnect if the app bridge has taken over
   if (isAppBridgeRunning()) {
-    console.log('[bootstrap] App bridge is running — staying dormant');
+    console.log('[workspace-agent] App bridge is running — staying dormant');
     setTimeout(connect, 30000); // check again in 30s
     return;
   }
 
-  console.log('[bootstrap] ->', wsUrl);
+  console.log('[workspace-agent] ->', wsUrl);
   ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
-    console.log('[bootstrap] Connected, authenticating...');
+    console.log('[workspace-agent] Connected, authenticating...');
     ws.send(JSON.stringify(auth));
     reconnectDelay = 3000;
   });
@@ -89,23 +89,23 @@ function connect() {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'gateway_auth_ok') {
-        console.log('[bootstrap] Authenticated');
+        console.log('[workspace-agent] Authenticated');
         authenticated = true;
         return;
       }
       if (msg.type === 'gateway_auth_error') {
-        console.error('[bootstrap] Auth failed:', msg.error);
+        console.error('[workspace-agent] Auth failed:', msg.error);
         return;
       }
       handleMessage(msg);
     } catch (e) {
-      console.warn('[bootstrap] Bad message:', e.message);
+      console.warn('[workspace-agent] Bad message:', e.message);
     }
   });
 
   ws.on('close', (code, reason) => {
     authenticated = false;
-    console.log(`[bootstrap] Disconnected: ${code} ${reason || ''}`);
+    console.log(`[workspace-agent] Disconnected: ${code} ${reason || ''}`);
     if (!shuttingDown) {
       setTimeout(connect, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
@@ -113,7 +113,7 @@ function connect() {
   });
 
   ws.on('error', (err) => {
-    console.warn('[bootstrap] WS error:', err.message);
+    console.warn('[workspace-agent] WS error:', err.message);
   });
 }
 
@@ -164,7 +164,7 @@ function isUrlTrusted(url) {
 
 // ── install_app ─────────────────────────────────────────────────────────────
 async function handleInstallApp(msg) {
-  const { id, slug, identifier, artifactUrl, sourceUrl, env, manifest } = msg;
+  const { id, slug, identifier, artifactUrl, sourceUrl, subdir, env, manifest } = msg;
 
   // Validate slug before use in shell commands or file paths
   if (!slug || !SAFE_SLUG.test(slug)) {
@@ -186,18 +186,18 @@ async function handleInstallApp(msg) {
     return;
   }
 
-  console.log(`[bootstrap] Installing app: ${slug} -> ${appDir}`);
+  console.log(`[workspace-agent] Installing app: ${slug} -> ${appDir}`);
 
   // Validate download URLs against the trusted domain allowlist before proceeding
   if (artifactUrl && !isUrlTrusted(artifactUrl)) {
     const domain = (() => { try { return new URL(artifactUrl).hostname; } catch { return 'invalid'; } })();
-    console.error(`[bootstrap] Install rejected for ${slug}: untrusted artifact URL domain: ${domain}`);
+    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted artifact URL domain: ${domain}`);
     send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted artifact URL domain: ${domain}` });
     return;
   }
   if (sourceUrl && !isUrlTrusted(sourceUrl)) {
     const domain = (() => { try { return new URL(sourceUrl).hostname; } catch { return 'invalid'; } })();
-    console.error(`[bootstrap] Install rejected for ${slug}: untrusted source URL domain: ${domain}`);
+    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted source URL domain: ${domain}`);
     send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted source URL domain: ${domain}` });
     return;
   }
@@ -213,7 +213,7 @@ async function handleInstallApp(msg) {
       for (const [k, v] of Object.entries(env)) {
         // Validate env key format (uppercase letters, digits, underscores only)
         if (!VALID_ENV_KEY.test(k)) {
-          console.warn(`[bootstrap] Skipping invalid env key: ${k}`);
+          console.warn(`[workspace-agent] Skipping invalid env key: ${k}`);
           continue;
         }
         // Sanitize value: strip newlines and shell metacharacters that could escape the env file
@@ -250,7 +250,7 @@ async function handleInstallApp(msg) {
           try { fs.unlinkSync(tmpFile); } catch {}
           return;
         }
-        console.log(`[bootstrap] Artifact integrity verified: ${hash.slice(0, 8)}...`);
+        console.log(`[workspace-agent] Artifact integrity verified: ${hash.slice(0, 8)}...`);
       }
 
       sendProgress(id, slug, 'extracting', 30);
@@ -259,14 +259,36 @@ async function handleInstallApp(msg) {
 
       // Find the inner directory (GitHub archives have a root dir)
       const entries = fs.readdirSync(tmpDir);
-      const src = entries.length === 1 && fs.statSync(path.join(tmpDir, entries[0])).isDirectory()
+      let src = entries.length === 1 && fs.statSync(path.join(tmpDir, entries[0])).isDirectory()
         ? path.join(tmpDir, entries[0])
         : tmpDir;
+
+      // Navigate to subdir if specified (monorepo: e.g. apps/cliproxy)
+      if (subdir) {
+        const sub = path.join(src, subdir);
+        if (fs.existsSync(sub)) {
+          src = sub;
+          console.log('[bootstrap] Using subdir: ' + subdir);
+        }
+      }
 
       await execAsync(`cp -a "${src}/." "${appDir}/"`, { timeout: 15000 });
       await execAsync(`rm -rf "${tmpFile}" "${tmpDir}"`);
     } else if (sourceUrl) {
-      await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}" 2>/dev/null || (cd "${appDir}" && git pull)`, { timeout: 120000 });
+      // Convert GitHub tree URLs to sparse checkout
+      const ghMatch = sourceUrl.match(/^(https:\/\/github\.com\/[^/]+\/[^/]+)\/tree\/([^/]+)\/(.+)$/);
+      if (ghMatch) {
+        const repoUrl = ghMatch[1] + '.git';
+        const ghSubdir = ghMatch[3];
+        const tmpSparse = '/tmp/sparse-' + slug;
+        await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
+        await execAsync('git clone --depth 1 --filter=blob:none --sparse "' + repoUrl + '" ' + tmpSparse, { timeout: 120000 });
+        await execAsync('cd ' + tmpSparse + ' && git sparse-checkout set "' + ghSubdir + '"', { timeout: 30000 });
+        await execAsync('cp -a ' + tmpSparse + '/' + ghSubdir + '/. ' + appDir + '/', { timeout: 15000 });
+        await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
+      } else {
+        await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}" 2>/dev/null || (cd "${appDir}" && git pull)`, { timeout: 120000 });
+      }
     }
 
     // 3. Run install.sh if present
@@ -300,13 +322,20 @@ async function handleInstallApp(msg) {
     const ecoFile = path.join(appDir, 'ecosystem.config.js');
     if (fs.existsSync(ecoFile)) {
       await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 });
+    } else if (manifest?.startup) {
+      // No ecosystem file — generate one from manifest startup command
+      const startupCmd = manifest.startup;
+      const eco = 'module.exports = { apps: [{ name: ' + JSON.stringify(slug) + ', script: "/bin/bash", args: ["-c", ' + JSON.stringify(startupCmd) + '], cwd: ' + JSON.stringify(appDir) + ', autorestart: true }] };';
+      fs.writeFileSync(ecoFile, eco);
+      await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 });
+      console.log('[bootstrap] Generated ecosystem from manifest.startup for ' + slug);
     }
 
     sendProgress(id, slug, 'complete', 100);
     send({ type: 'install_result', id, slug, status: 'ok' });
-    console.log(`[bootstrap] App installed: ${slug}`);
+    console.log(`[workspace-agent] App installed: ${slug}`);
   } catch (err) {
-    console.error(`[bootstrap] Install failed for ${slug}:`, err.message);
+    console.error(`[workspace-agent] Install failed for ${slug}:`, err.message);
     send({ type: 'install_result', id, slug, status: 'error', error: err.message });
   }
 }
@@ -361,13 +390,13 @@ function handleUninstallApp(msg) {
           fs.writeFileSync(secretsPath, secrets);
         }
       }
-    } catch (e) { console.warn('[bootstrap] Failed to clean env vars:', e.message); }
+    } catch (e) { console.warn('[workspace-agent] Failed to clean env vars:', e.message); }
 
     // Remove app directory
     fs.rmSync(appDir, { recursive: true, force: true });
 
     send({ type: 'uninstall_result', id, slug, status: 'ok' });
-    console.log(`[bootstrap] App uninstalled: ${slug}`);
+    console.log(`[workspace-agent] App uninstalled: ${slug}`);
   } catch (err) {
     send({ type: 'uninstall_result', id, slug, status: 'error', error: err.message });
   }
@@ -455,7 +484,7 @@ function handleExec(msg) {
 
   // Validate command against allowlist
   if (!isCommandAllowed(command)) {
-    console.warn(`[bootstrap] exec rejected: command not in allowlist: ${command.slice(0, 80)}`);
+    console.warn(`[workspace-agent] exec rejected: command not in allowlist: ${command.slice(0, 80)}`);
     send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: not in allowlist' });
     return;
   }
@@ -464,7 +493,7 @@ function handleExec(msg) {
   // $(), |, >, < are allowed because the router legitimately uses them in exec commands.
   // The allowlist above is the primary security layer.
   if (/[;`]/.test(command)) {
-    console.warn(`[bootstrap] exec rejected: disallowed shell characters`);
+    console.warn(`[workspace-agent] exec rejected: disallowed shell characters`);
     send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' });
     return;
   }
@@ -486,7 +515,7 @@ function handleExec(msg) {
     ? ['sudo', ['-u', user, 'bash', '-c', command], { cwd: cwd || '/tmp' }]
     : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
 
-  console.log(`[bootstrap] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
+  console.log(`[workspace-agent] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
   const child = spawn(args[0], args[1], { ...args[2], detached: true, env: { ...process.env, HOME: `/home/${user || 'workspace'}` } });
   let stdout = '', stderr = '';
 
@@ -538,7 +567,7 @@ const healthServer = http.createServer((req, res) => {
 });
 
 healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
-  console.log(`[bootstrap] Health on :${HEALTH_PORT}`);
+  console.log(`[workspace-agent] Health on :${HEALTH_PORT}`);
 });
 
 // ── Startup ─────────────────────────────────────────────────────────────────
