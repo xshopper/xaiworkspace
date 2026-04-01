@@ -220,41 +220,55 @@ function isUrlTrusted(url) {
 // ── Backup / restore helpers ────────────────────────────────────────────────
 const BOOTSTRAP_FILES = ['bridge.js', 'entrypoint.sh', 'ecosystem.config.js', 'package.json'];
 
-function backupDir(srcDir, backupDir) {
-  fs.mkdirSync(backupDir, { recursive: true });
+// Recursively copy srcDir → dstDir. Uses lstatSync to avoid following symlinks.
+// Symlinks are reproduced as symlinks rather than copied as files/dirs.
+function copyDirRecursive(srcDir, dstDir) {
+  fs.mkdirSync(dstDir, { recursive: true });
   for (const f of fs.readdirSync(srcDir)) {
     const s = path.join(srcDir, f);
-    const d = path.join(backupDir, f);
-    const stat = fs.statSync(s);
-    if (stat.isDirectory()) {
-      backupDir_inner(s, d);
+    const d = path.join(dstDir, f);
+    const lstat = fs.lstatSync(s);
+    if (lstat.isSymbolicLink()) {
+      const target = fs.readlinkSync(s);
+      try { fs.unlinkSync(d); } catch {}
+      fs.symlinkSync(target, d);
+    } else if (lstat.isDirectory()) {
+      copyDirRecursive(s, d);
     } else {
       fs.copyFileSync(s, d);
     }
   }
 }
 
-function backupDir_inner(srcDir, dstDir) {
-  fs.mkdirSync(dstDir, { recursive: true });
-  for (const f of fs.readdirSync(srcDir)) {
-    const s = path.join(srcDir, f);
-    const d = path.join(dstDir, f);
-    if (fs.statSync(s).isDirectory()) backupDir_inner(s, d);
-    else fs.copyFileSync(s, d);
-  }
+// Back up srcDir into a new dstDir (dstDir must not exist yet).
+function backupAppDir(srcDir, dstDir) {
+  copyDirRecursive(srcDir, dstDir);
 }
 
-function restoreDir(backupDir, dstDir) {
-  // Remove everything in dstDir except node_modules (preserve installed deps)
+// Restore dstDir from backupSrc. Removes all non-node_modules content in dstDir
+// first, then copies from backup (excluding node_modules — preserves current deps).
+function restoreAppDir(backupSrc, dstDir) {
+  if (!fs.existsSync(dstDir)) fs.mkdirSync(dstDir, { recursive: true });
+  // Remove current content (except node_modules)
   for (const f of fs.readdirSync(dstDir)) {
     if (f === 'node_modules') continue;
     fs.rmSync(path.join(dstDir, f), { recursive: true, force: true });
   }
-  for (const f of fs.readdirSync(backupDir)) {
-    const s = path.join(backupDir, f);
+  // Restore from backup (also skip node_modules — keep the current installed deps)
+  for (const f of fs.readdirSync(backupSrc)) {
+    if (f === 'node_modules') continue;
+    const s = path.join(backupSrc, f);
     const d = path.join(dstDir, f);
-    if (fs.statSync(s).isDirectory()) backupDir_inner(s, d);
-    else fs.copyFileSync(s, d);
+    const lstat = fs.lstatSync(s);
+    if (lstat.isSymbolicLink()) {
+      const target = fs.readlinkSync(s);
+      try { fs.unlinkSync(d); } catch {}
+      fs.symlinkSync(target, d);
+    } else if (lstat.isDirectory()) {
+      copyDirRecursive(s, d);
+    } else {
+      fs.copyFileSync(s, d);
+    }
   }
 }
 
@@ -268,7 +282,6 @@ async function handleSelfUpdate(msg) {
 
   console.log(`[workspace-agent] Self-update: ${AGENT_VERSION} → ${version}`);
 
-  // Validate URL
   if (artifactUrl && !isUrlTrusted(artifactUrl)) {
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted URL' });
     return;
@@ -279,36 +292,38 @@ async function handleSelfUpdate(msg) {
   }
 
   const bootstrapDir = '/opt/bootstrap';
-  const tmpDir = `/tmp/bootstrap-update-${Date.now()}`;
-  const backupPath = `/tmp/bootstrap-backup-${Date.now()}`;
-  let backedUp = false;
+  // Use randomUUID to guarantee unique paths even if called twice in the same ms
+  const uid = randomUUID();
+  const tmpDir = `/tmp/bootstrap-update-${uid}`;
+  const backupPath = `/tmp/bootstrap-backup-${uid}`;
 
   // Back up current bootstrap files before touching anything
   try {
     fs.mkdirSync(backupPath, { recursive: true });
     for (const f of BOOTSTRAP_FILES) {
-      const src2 = path.join(bootstrapDir, f);
-      if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(backupPath, f));
+      const src = path.join(bootstrapDir, f);
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(backupPath, f));
     }
-    backedUp = true;
     console.log(`[workspace-agent] Bootstrap backed up to ${backupPath}`);
   } catch (backupErr) {
     console.error(`[workspace-agent] Backup failed, aborting update:`, backupErr.message);
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Backup failed: ' + backupErr.message });
+    fs.rmSync(backupPath, { recursive: true, force: true });
     return;
   }
 
   const rollback = (reason) => {
     console.error(`[workspace-agent] Rolling back bootstrap: ${reason}`);
-    try {
-      for (const f of BOOTSTRAP_FILES) {
-        const src2 = path.join(backupPath, f);
-        if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
+    let allOk = true;
+    for (const f of BOOTSTRAP_FILES) {
+      const src = path.join(backupPath, f);
+      if (fs.existsSync(src)) {
+        try { fs.copyFileSync(src, path.join(bootstrapDir, f)); }
+        catch (e) { console.error(`[workspace-agent] Rollback failed to restore ${f}:`, e.message); allOk = false; }
       }
-      console.log(`[workspace-agent] Bootstrap restored from backup`);
-    } catch (e) {
-      console.error(`[workspace-agent] Rollback copy failed:`, e.message);
     }
+    if (allOk) console.log(`[workspace-agent] Bootstrap restored from backup`);
+    return allOk;
   };
 
   try {
@@ -320,13 +335,10 @@ async function handleSelfUpdate(msg) {
       const tmpFile = `${tmpDir}/bootstrap.zip`;
       await execAsync(`curl -sfL "${artifactUrl}" -o "${tmpFile}"`, { timeout: 60000 });
       await execAsync(`unzip -qo "${tmpFile}" -d "${tmpDir}/extract"`, { timeout: 30000 });
-
-      // Find inner directory (GitHub archive root)
       const entries = fs.readdirSync(`${tmpDir}/extract`);
-      src = entries.length === 1 && fs.statSync(path.join(`${tmpDir}/extract`, entries[0])).isDirectory()
+      src = entries.length === 1 && fs.lstatSync(path.join(`${tmpDir}/extract`, entries[0])).isDirectory()
         ? path.join(`${tmpDir}/extract`, entries[0])
         : `${tmpDir}/extract`;
-
       if (subdir) {
         const sub = path.join(src, subdir);
         if (fs.existsSync(sub)) src = sub;
@@ -343,44 +355,44 @@ async function handleSelfUpdate(msg) {
     if (!src) throw new Error('No artifact or source URL provided');
 
     const newBridge = path.join(src, 'bridge.js');
-    if (!fs.existsSync(newBridge)) {
-      throw new Error('bridge.js not found in update package');
-    }
+    if (!fs.existsSync(newBridge)) throw new Error('bridge.js not found in update package');
 
     // Copy new files into bootstrap dir
     fs.copyFileSync(newBridge, path.join(bootstrapDir, 'bridge.js'));
     for (const f of ['entrypoint.sh', 'ecosystem.config.js', 'package.json']) {
-      const src2 = path.join(src, f);
-      if (fs.existsSync(src2)) fs.copyFileSync(src2, path.join(bootstrapDir, f));
+      const srcFile = path.join(src, f);
+      if (fs.existsSync(srcFile)) fs.copyFileSync(srcFile, path.join(bootstrapDir, f));
     }
 
-    // Install deps if package.json changed
+    // Run npm install — if this fails, roll back before reporting error
     const pkgJson = path.join(bootstrapDir, 'package.json');
     if (fs.existsSync(pkgJson)) {
       await execAsync('npm install --omit=dev --loglevel=error', { cwd: bootstrapDir, timeout: 60000 });
     }
 
-    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
-    console.log(`[workspace-agent] Self-update complete, restarting...`);
+    console.log(`[workspace-agent] Self-update staged, restarting...`);
 
-    // Restart via pm2 after a brief delay (let the result message send)
-    setTimeout(() => {
-      try {
-        execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
-      } catch (restartErr) {
-        // pm2 restart failed — restore backup and exit so pm2 auto-restarts old version
-        console.error(`[workspace-agent] pm2 restart failed, restoring backup:`, restartErr.message);
-        rollback('pm2 restart failed');
-        process.exit(0);
-      }
-    }, 500);
+    // Attempt pm2 restart — if it fails, roll back and report error (do NOT send ok first)
+    try {
+      // Flush the WS send queue before restarting by deferring to next tick
+      await new Promise(resolve => setTimeout(resolve, 200));
+      execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
+      // If we reach here the process is being replaced — send ok on a best-effort basis
+      send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok' });
+    } catch (restartErr) {
+      console.error(`[workspace-agent] pm2 restart failed, rolling back:`, restartErr.message);
+      rollback('pm2 restart failed');
+      send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'pm2 restart failed: ' + restartErr.message });
+      // Exit so pm2 auto-restarts with the restored old version
+      setTimeout(() => process.exit(0), 200);
+    }
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
-    if (backedUp) rollback(err.message);
+    rollback(err.message);
     send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: err.message });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    // Keep backup around until pm2 restarts successfully; clean up on next boot via entrypoint
+    fs.rmSync(backupPath, { recursive: true, force: true });
   }
 }
 
@@ -391,40 +403,26 @@ async function handleInstallApp(msg) {
 
   // Self-update: router sends slug 'bootstrap' to upgrade the workspace agent
   if (slug === 'bootstrap') {
-    handleSelfUpdate(msg);
+    await handleSelfUpdate(msg);
     return;
   }
 
-  // Deduplicate — skip if this slug is already being installed
-  if (_installingApps.has(slug)) {
-    console.log('[workspace-agent] Skipping duplicate install for ' + slug);
-    return;
-  }
-  _installingApps.add(slug);
-
-  // Validate slug before use in shell commands or file paths
+  // All validation happens BEFORE _installingApps.add() so leaked-slug bugs are impossible
   if (!slug || !SAFE_SLUG.test(slug)) {
     send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid slug' });
     return;
   }
-
-  // Validate identifier format to prevent path traversal
   if (identifier && !SAFE_IDENTIFIER.test(identifier)) {
     send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid identifier' });
     return;
   }
 
   const appDir = path.join(APPS_DIR, identifier || `com.xshopper.${slug}`);
-
-  // Verify resolved path stays within APPS_DIR (defense in depth against path traversal)
   if (!path.resolve(appDir).startsWith(path.resolve(APPS_DIR))) {
     send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid identifier' });
     return;
   }
 
-  console.log(`[workspace-agent] Installing app: ${slug} -> ${appDir}`);
-
-  // Validate download URLs against the trusted domain allowlist before proceeding
   if (artifactUrl && !isUrlTrusted(artifactUrl)) {
     const domain = (() => { try { return new URL(artifactUrl).hostname; } catch { return 'invalid'; } })();
     console.error(`[workspace-agent] Install rejected for ${slug}: untrusted artifact URL domain: ${domain}`);
@@ -438,13 +436,22 @@ async function handleInstallApp(msg) {
     return;
   }
 
+  // Deduplicate — skip if this slug is already being installed (after validation, before backup)
+  if (_installingApps.has(slug)) {
+    console.log('[workspace-agent] Skipping duplicate install for ' + slug);
+    return;
+  }
+  _installingApps.add(slug);
+
+  console.log(`[workspace-agent] Installing app: ${slug} -> ${appDir}`);
+
   // Back up existing installation before touching anything (upgrade path)
   const isUpgrade = fs.existsSync(appDir);
-  const appBackupPath = `/tmp/app-${slug}-backup-${Date.now()}`;
+  const appBackupPath = `/tmp/app-${slug}-backup-${randomUUID()}`;
   let appBackedUp = false;
   if (isUpgrade) {
     try {
-      backupDir(appDir, appBackupPath);
+      backupAppDir(appDir, appBackupPath);
       appBackedUp = true;
       console.log(`[workspace-agent] App ${slug} backed up to ${appBackupPath}`);
     } catch (backupErr) {
@@ -458,10 +465,9 @@ async function handleInstallApp(msg) {
   const rollbackApp = async (reason) => {
     console.error(`[workspace-agent] Rolling back ${slug}: ${reason}`);
     try {
-      // Restore files from backup
-      restoreDir(appBackupPath, appDir);
+      restoreAppDir(appBackupPath, appDir);
       console.log(`[workspace-agent] App ${slug} restored from backup`);
-      // Restart the old pm2 process if it was running
+      // Restart the old pm2 process
       const ecoFile = path.join(appDir, 'ecosystem.config.js');
       if (fs.existsSync(ecoFile)) {
         await execAsync(`pm2 start "${ecoFile}" --update-env`, { timeout: 30000 }).catch(() => {});
@@ -517,9 +523,8 @@ async function handleInstallApp(msg) {
         const fileBuffer = fs.readFileSync(tmpFile);
         const hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
         if (hash !== msg.sha256) {
-          send({ type: 'install_result', id, slug, status: 'error', error: `Artifact integrity check failed (expected ${msg.sha256.slice(0, 8)}..., got ${hash.slice(0, 8)}...)` });
           try { fs.unlinkSync(tmpFile); } catch {}
-          return;
+          throw new Error(`Artifact integrity check failed (expected ${msg.sha256.slice(0, 8)}..., got ${hash.slice(0, 8)}...)`);
         }
         console.log(`[workspace-agent] Artifact integrity verified: ${hash.slice(0, 8)}...`);
       }
