@@ -65,6 +65,56 @@ function isAppBridgeRunning() {
   } catch { return false; }
 }
 
+// ── Report installed apps to the router after auth ─────────────────────────
+function readManifestVersion(slug) {
+  // Scan all directories in ~/apps/ for a manifest.yml matching this slug
+  const appsDir = path.join(HOME, 'apps');
+  try {
+    const dirs = fs.readdirSync(appsDir);
+    for (const dir of dirs) {
+      const manifestPath = path.join(appsDir, dir, 'manifest.yml');
+      try {
+        const yaml = fs.readFileSync(manifestPath, 'utf-8');
+        const slugMatch = yaml.match(/^slug:\s*['"]?([^\s'"]+)/m);
+        if (slugMatch && slugMatch[1] === slug) {
+          const verMatch = yaml.match(/^version:\s*['"]?([^\s'"]+)/m);
+          return verMatch ? verMatch[1] : null;
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+function reportInstalledApps() {
+  try {
+    const list = execSync('pm2 jlist --no-color', { encoding: 'utf-8', timeout: 5000 });
+    const procs = JSON.parse(list);
+    // Filter out system processes — only report installed apps
+    const systemProcs = new Set(['bootstrap-bridge', 'bridge', 'updater']);
+    const apps = procs
+      .filter(p => !systemProcs.has(p.name))
+      .map(p => ({
+        slug: p.name,
+        status: p.pm2_env?.status || 'unknown',
+        version: readManifestVersion(p.name),
+        restarts: p.pm2_env?.restart_time || 0,
+        memory: p.monit?.memory || 0,
+        cpu: p.monit?.cpu || 0,
+      }));
+    if (apps.length > 0 && ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'apps_status',
+        instanceId: INSTANCE_ID,
+        apps,
+      }));
+      console.log('[workspace-agent] Reported ' + apps.length + ' app(s): ' + apps.map(a => a.slug + ' v' + (a.version || '?') + ' (' + a.status + ')').join(', '));
+    }
+  } catch (e) {
+    console.warn('[workspace-agent] Failed to report apps:', e.message);
+  }
+}
+
 // ── WebSocket connection ────────────────────────────────────────────────────
 function connect() {
   if (shuttingDown) return;
@@ -91,6 +141,8 @@ function connect() {
       if (msg.type === 'gateway_auth_ok') {
         console.log('[workspace-agent] Authenticated');
         authenticated = true;
+        // Report installed apps (pm2 processes) so the router knows what's running
+        reportInstalledApps();
         return;
       }
       if (msg.type === 'gateway_auth_error') {
