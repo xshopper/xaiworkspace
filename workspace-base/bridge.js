@@ -217,6 +217,23 @@ function isUrlTrusted(url) {
   }
 }
 
+// Reject URLs whose path/query contains shell metacharacters that could escape
+// the double-quoted shell arguments used in curl/git execAsync calls.
+const SHELL_UNSAFE = /[$`()|;&\n\r\\]/;
+function isUrlShellSafe(url) {
+  try {
+    const parsed = new URL(url);
+    return !SHELL_UNSAFE.test(parsed.pathname + parsed.search + parsed.hash);
+  } catch { return false; }
+}
+
+// Validate subdir: must be a relative path with no shell metacharacters.
+// Allows letters, digits, hyphens, underscores, dots, and forward slashes only.
+const SAFE_SUBDIR = /^[a-zA-Z0-9._\-/]+$/;
+function isSubdirSafe(s) {
+  return typeof s === 'string' && SAFE_SUBDIR.test(s) && !s.includes('..');
+}
+
 // ── Backup / restore helpers ────────────────────────────────────────────────
 const BOOTSTRAP_FILES = ['bridge.js', 'entrypoint.sh', 'ecosystem.config.js', 'package.json'];
 
@@ -282,12 +299,16 @@ async function handleSelfUpdate(msg) {
 
   console.log(`[workspace-agent] Self-update: ${AGENT_VERSION} → ${version}`);
 
-  if (artifactUrl && !isUrlTrusted(artifactUrl)) {
-    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted URL' });
+  if (artifactUrl && (!isUrlTrusted(artifactUrl) || !isUrlShellSafe(artifactUrl))) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted or unsafe URL' });
     return;
   }
-  if (sourceUrl && !isUrlTrusted(sourceUrl)) {
-    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted URL' });
+  if (sourceUrl && (!isUrlTrusted(sourceUrl) || !isUrlShellSafe(sourceUrl))) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Untrusted or unsafe URL' });
+    return;
+  }
+  if (subdir && !isSubdirSafe(subdir)) {
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'Invalid subdir' });
     return;
   }
 
@@ -442,16 +463,25 @@ async function handleInstallApp(msg) {
     return;
   }
 
-  if (artifactUrl && !isUrlTrusted(artifactUrl)) {
+  if (artifactUrl && (!isUrlTrusted(artifactUrl) || !isUrlShellSafe(artifactUrl))) {
     const domain = (() => { try { return new URL(artifactUrl).hostname; } catch { return 'invalid'; } })();
-    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted artifact URL domain: ${domain}`);
-    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted artifact URL domain: ${domain}` });
+    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted/unsafe artifact URL: ${domain}`);
+    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted or unsafe artifact URL` });
     return;
   }
-  if (sourceUrl && !isUrlTrusted(sourceUrl)) {
+  if (sourceUrl && (!isUrlTrusted(sourceUrl) || !isUrlShellSafe(sourceUrl))) {
     const domain = (() => { try { return new URL(sourceUrl).hostname; } catch { return 'invalid'; } })();
-    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted source URL domain: ${domain}`);
-    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted source URL domain: ${domain}` });
+    console.error(`[workspace-agent] Install rejected for ${slug}: untrusted/unsafe source URL: ${domain}`);
+    send({ type: 'install_result', id, slug, status: 'error', error: `Untrusted or unsafe source URL` });
+    return;
+  }
+  if (subdir && !isSubdirSafe(subdir)) {
+    send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid subdir' });
+    return;
+  }
+  // Validate id used in temp filenames — must be UUID-like (hex + hyphens only)
+  if (!id || !/^[a-f0-9\-]+$/i.test(id)) {
+    send({ type: 'install_result', id, slug, status: 'error', error: 'Invalid install id' });
     return;
   }
 
@@ -517,7 +547,7 @@ async function handleInstallApp(msg) {
         }
         // Sanitize value: strip newlines and shell metacharacters that could escape the env file
         const sanitized = String(v).replace(/[\n\r`$\\;|&"']/g, '');
-        if (!existing.includes(`${k}=`)) {
+        if (!new RegExp('^' + k + '=', 'm').test(existing)) {
           fs.appendFileSync(secretsPath, `${k}=${sanitized}\n`);
           addedKeys.push(k);
         }
@@ -557,7 +587,7 @@ async function handleInstallApp(msg) {
 
       // Find the inner directory (GitHub archives have a root dir)
       const entries = fs.readdirSync(tmpDir);
-      let src = entries.length === 1 && fs.statSync(path.join(tmpDir, entries[0])).isDirectory()
+      let src = entries.length === 1 && fs.lstatSync(path.join(tmpDir, entries[0])).isDirectory()
         ? path.join(tmpDir, entries[0])
         : tmpDir;
 
@@ -585,7 +615,12 @@ async function handleInstallApp(msg) {
         await execAsync('cp -a ' + tmpSparse + '/' + ghSubdir + '/. ' + appDir + '/', { timeout: 15000 });
         await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
       } else {
-        await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}" 2>/dev/null || (cd "${appDir}" && git pull)`, { timeout: 120000 });
+        // Clone fresh; if directory already exists from a previous install, remove it first
+        // (don't silently fall back to git pull — a clone failure should be an error)
+        if (fs.existsSync(appDir)) {
+          await execAsync(`rm -rf "${appDir}"`, { timeout: 10000 });
+        }
+        await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}"`, { timeout: 120000 });
       }
     }
 
@@ -716,6 +751,12 @@ function handleUninstallApp(msg) {
           const secretsPath = SECRETS_FILE;
           let secrets = fs.readFileSync(secretsPath, 'utf8');
           for (const key of keysToRemove) {
+            // Re-validate key from disk against the same pattern used at write time
+            // to prevent regex injection if .env-keys was tampered with by install.sh
+            if (!VALID_ENV_KEY.test(key)) {
+              console.warn(`[workspace-agent] Skipping unsafe key in .env-keys: ${key}`);
+              continue;
+            }
             secrets = secrets.replace(new RegExp(`^${key}=.*\\n?`, 'mg'), '');
             delete process.env[key];
           }
