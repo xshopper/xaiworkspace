@@ -215,8 +215,16 @@ function isUrlTrusted(url) {
 }
 
 // ── install_app ─────────────────────────────────────────────────────────────
+const _installingApps = new Set();
 async function handleInstallApp(msg) {
   const { id, slug, identifier, artifactUrl, sourceUrl, subdir, env, manifest } = msg;
+
+  // Deduplicate — skip if this slug is already being installed
+  if (_installingApps.has(slug)) {
+    console.log('[workspace-agent] Skipping duplicate install for ' + slug);
+    return;
+  }
+  _installingApps.add(slug);
 
   // Validate slug before use in shell commands or file paths
   if (!slug || !SAFE_SLUG.test(slug)) {
@@ -289,7 +297,7 @@ async function handleInstallApp(msg) {
     }
 
     if (artifactUrl) {
-      const tmpFile = `/tmp/app-${slug}.zip`;
+      const tmpFile = `/tmp/app-${slug}-${id.slice(0,8)}.zip`;
       await execAsync(`curl -sfL "${artifactUrl}" -o "${tmpFile}"`, { timeout: 60000 });
 
       // Verify artifact integrity if SHA-256 hash was provided
@@ -306,7 +314,7 @@ async function handleInstallApp(msg) {
       }
 
       sendProgress(id, slug, 'extracting', 30);
-      const tmpDir = `/tmp/app-${slug}-extract`;
+      const tmpDir = `/tmp/app-${slug}-${id.slice(0,8)}-extract`;
       await execAsync(`rm -rf "${tmpDir}" && mkdir -p "${tmpDir}" && unzip -qo "${tmpFile}" -d "${tmpDir}"`, { timeout: 30000 });
 
       // Find the inner directory (GitHub archives have a root dir)
@@ -389,6 +397,8 @@ async function handleInstallApp(msg) {
   } catch (err) {
     console.error(`[workspace-agent] Install failed for ${slug}:`, err.message);
     send({ type: 'install_result', id, slug, status: 'error', error: err.message });
+  } finally {
+    _installingApps.delete(slug);
   }
 }
 
