@@ -1,10 +1,8 @@
 mod config;
 mod docker;
 mod bridge;
-mod oauth;
 mod tray;
 
-use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
 #[tauri::command]
@@ -14,37 +12,52 @@ fn get_status() -> serde_json::Value {
     })
 }
 
-/// Startup: install Docker if needed, then sit in tray.
+/// Startup: check Docker availability, then sit in tray.
+/// Docker installation is the user's responsibility — the frontend Settings page
+/// shows Docker install instructions in the "Add System → Docker" tab.
 /// No bridge provisioning — that happens via deep link from the website.
 async fn run_setup(app: AppHandle) {
     // Wait for webview to load before emitting events
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    let _ = app.emit("setup-progress", serde_json::json!({
-        "step": "Checking Docker...",
-        "percent": 20
-    }));
-
     if !docker::is_available() {
         let _ = app.emit("setup-progress", serde_json::json!({
-            "step": "Installing Docker...",
-            "percent": 30
+            "step": "Docker not found — install Docker Desktop to continue",
+            "percent": 0
         }));
-        if let Err(e) = docker::install(&app).await {
-            let _ = app.emit("setup-error", serde_json::json!({ "error": e }));
-            return;
-        }
+        eprintln!("[setup] Docker not found. Install Docker Desktop from https://docs.docker.com/get-docker/");
+        // Don't return — still set up tray so user can quit gracefully
     }
 
-    // Docker ready — hide window immediately (no need to show it)
+    // Hide window — sit in tray
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
 }
 
+/// Timestamp of last provision start — dedup window of 30 seconds.
+static LAST_PROVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Handle deep link: xaiworkspace://provision?router=URL&app=URL&token=JWT
 /// Called when user clicks "Add System" on the website.
+///
+/// Tauri's only job is to kick off the bridge Docker container.
+/// All network activity (OAuth interception, WebSocket, router registration)
+/// happens inside the bridge container, not in Tauri.
 async fn handle_provision(app: AppHandle, params: ProvisionParams) {
+    // Prevent duplicate provision calls — deep link fires from multiple OS handlers on Linux.
+    // 5-second cooldown catches duplicate handlers without blocking legitimate re-adds.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_PROVISION.load(std::sync::atomic::Ordering::SeqCst);
+    if now.saturating_sub(last) < 5 {
+        eprintln!("[provision] Already provisioning — ignoring duplicate deep link");
+        return;
+    }
+    LAST_PROVISION.store(now, std::sync::atomic::Ordering::SeqCst);
+
     let router_url = params.router_url;
     let app_url = params.app_url;
     let token = params.token;
@@ -71,19 +84,15 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
         cfg.bridge_image = image;
     }
 
-    // Ensure Docker is available
+    // Check Docker is available — user must install it themselves
     if !docker::is_available() {
-        let _ = app.emit("setup-progress", serde_json::json!({
-            "step": "Installing Docker...",
-            "percent": 20
+        let _ = app.emit("setup-error", serde_json::json!({
+            "error": "Docker is not installed or not running. Install Docker Desktop from https://docs.docker.com/get-docker/ and try again."
         }));
-        if let Err(e) = docker::install(&app).await {
-            let _ = app.emit("setup-error", serde_json::json!({ "error": e }));
-            return;
-        }
+        return;
     }
 
-    // Create a new bridge
+    // Create a new bridge container — all network activity happens inside it
     let _ = app.emit("setup-progress", serde_json::json!({
         "step": "Creating bridge...",
         "percent": 50
@@ -91,15 +100,23 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
 
     match bridge::create_new_bridge(&cfg, token.as_deref()).await {
         Ok(pairing_url) => {
-            let _ = app.emit("setup-progress", serde_json::json!({
-                "step": "Opening browser...",
-                "percent": 90
-            }));
-            let _ = open::that(&pairing_url);
-            let _ = app.emit("setup-progress", serde_json::json!({
-                "step": "Done!",
-                "percent": 100
-            }));
+            if pairing_url.is_empty() {
+                // Claimed directly via API — no browser needed
+                let _ = app.emit("setup-progress", serde_json::json!({
+                    "step": "System linked!",
+                    "percent": 100
+                }));
+            } else {
+                let _ = app.emit("setup-progress", serde_json::json!({
+                    "step": "Opening browser...",
+                    "percent": 90
+                }));
+                let _ = open::that(&pairing_url);
+                let _ = app.emit("setup-progress", serde_json::json!({
+                    "step": "Done!",
+                    "percent": 100
+                }));
+            }
         }
         Err(e) => {
             // Bridge container started but pairing failed — still usable
@@ -116,10 +133,6 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
-
-    // Start OAuth listeners
-    let oauth_mgr = Arc::new(oauth::OAuthManager::new(cfg.router_url.clone()));
-    oauth_mgr.start_all(&cfg).await;
 }
 
 /// Parsed deep link parameters.
@@ -206,10 +219,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![get_status])
         .setup(|app| {
-            // Set up system tray (minimal — just "Open" + "Quit")
-            let cfg = config::DesktopConfig::default();
-            let oauth_mgr = Arc::new(oauth::OAuthManager::new(cfg.router_url.clone()));
-            if let Err(e) = tray::setup(app.handle(), &cfg, oauth_mgr) {
+            // Set up system tray (minimal — just "Open" + bridge status + "Quit")
+            if let Err(e) = tray::setup(app.handle()) {
                 eprintln!("[Tray] Failed to set up system tray: {e}");
             }
 
@@ -252,7 +263,7 @@ pub fn run() {
                 });
             }
 
-            // Run startup (Docker install only, no bridge provisioning)
+            // Run startup check (Docker availability only — no network calls)
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 run_setup(handle).await;

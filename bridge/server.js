@@ -10,8 +10,18 @@
  */
 const http = require('http');
 const fs = require('fs');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const compose = require('./compose-manager');
+
+/** Timing-safe secret comparison to prevent timing side-channel attacks. */
+function safeCompare(a, b) {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 const ROUTER_URL = process.env.ROUTER_URL;
 if (!ROUTER_URL) {
@@ -30,7 +40,11 @@ const ROUTER_SECRET = process.env.ROUTER_SECRET
 if (!ROUTER_SECRET) {
   console.warn('[config] WARNING: ROUTER_SECRET not set (checked env var and /run/secrets/router_secret)');
 }
-const INSTANCE_ID = process.env.INSTANCE_ID || `xaiw-bridge-${require('crypto').randomBytes(8).toString('hex')}`;
+// BRIDGE_ID is the preferred name (from POST /api/bridges), INSTANCE_ID is the legacy fallback
+const INSTANCE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || `xaiw-bridge-${crypto.randomBytes(8).toString('hex')}`;
+// BRIDGE_TOKEN: when set, bridge was pre-provisioned via POST /api/bridges (user-authenticated).
+// Skip self-registration and use the token directly for WS auth.
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
@@ -66,6 +80,80 @@ let pairingCode = null;
 let pairingUrl = null;
 let registered = false;
 
+/**
+ * Pre-provisioned flow: bridge was created via POST /api/bridges (user-authenticated).
+ * BRIDGE_TOKEN is already set — write auth.json and mark as registered.
+ * The pairing code was already assigned server-side; we fetch it via the connect endpoint.
+ */
+async function setupPreProvisioned() {
+  console.log(`[pairing] Pre-provisioned bridge: ${INSTANCE_ID}`);
+
+  // Write credentials for bridge.js WS auth
+  const authData = {
+    type: 'gateway_auth',
+    instanceId: INSTANCE_ID,
+    instanceToken: BRIDGE_TOKEN,
+  };
+  fs.writeFileSync('/data/auth.json', JSON.stringify(authData));
+
+  // Restart bridge process with updated credentials
+  const { execSync } = require('child_process');
+  try {
+    execSync(`pm2 restart bridge --update-env`, {
+      env: { ...process.env, AUTH_JSON: JSON.stringify(authData) },
+      timeout: 10_000,
+    });
+    console.log('[pairing] Bridge process restarted with credentials');
+  } catch (err) {
+    console.warn('[pairing] Failed to restart bridge process:', err.message);
+  }
+
+  // Register with the router to get pairing code and confirm connectivity.
+  // Uses BRIDGE_TOKEN as x-bridge-token for auth (not ROUTER_SECRET).
+  try {
+    const url = new URL('/api/bridges/register', ROUTER_URL);
+    const resp = await fetch(url.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bridge-token': BRIDGE_TOKEN,
+      },
+      body: JSON.stringify({
+        bridgeId: INSTANCE_ID,
+        port: PORT,
+        region: process.env.REGION || 'local',
+        provider: process.env.PROVIDER || 'local',
+        version: require('./package.json').version,
+      }),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      pairingCode = data.pairingCode;
+      pairingUrl = `${APP_URL}/link?code=${pairingCode}`;
+    }
+  } catch (err) {
+    console.warn('[pairing] Failed to fetch pairing code:', err.message);
+  }
+
+  registered = true;
+  console.log('');
+  console.log('══════════════════════════════════════');
+  console.log(`  xAI Workspace Bridge ready!`);
+  if (pairingCode) {
+    console.log('');
+    console.log(`  Link: ${pairingUrl}`);
+    console.log(`  Code: ${pairingCode}`);
+    console.log('  Share this code with users to create workspaces.');
+  }
+  console.log('══════════════════════════════════════');
+  console.log('');
+}
+
+/**
+ * Self-registration flow: bridge registers with ROUTER_SECRET.
+ * Used when bridge is started manually (not via POST /api/bridges).
+ */
 async function registerBridge() {
   try {
     const url = new URL('/api/bridges/register', ROUTER_URL);
@@ -149,7 +237,7 @@ const server = http.createServer(async (req, res) => {
     }
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-router-secret');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-router-secret, x-bridge-token');
   };
   cors();
 
@@ -162,12 +250,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/pairing-code') {
-    // Require x-router-secret for pairing code access (internal bridge-to-desktop only)
-    const secret = req.headers['x-router-secret'];
-    if (!ROUTER_SECRET) {
-      // Secret not configured — allow local access (dev mode) but warn
-      console.warn('[pairing] /pairing-code served without auth (ROUTER_SECRET not configured)');
-    } else if (secret !== ROUTER_SECRET) {
+    // Accept x-router-secret OR x-bridge-token (Tauri reuse path uses bridge token)
+    const hasRouterSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasBridgeToken = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
+    if (!hasRouterSecret && !hasBridgeToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -187,8 +273,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/api/instances' && req.method === 'POST') {
-    // Auth: only the router can add/remove instances
-    if (req.headers['x-router-secret'] !== ROUTER_SECRET) {
+    // Auth: router can provision instances using either ROUTER_SECRET or BRIDGE_TOKEN.
+    // The provisioner sends x-bridge-token (per-bridge secret from DB).
+    // Legacy / local deployments may send x-router-secret.
+    const hasRouterSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasBridgeToken = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
+    if (!hasRouterSecret && !hasBridgeToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -216,7 +306,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url?.startsWith('/api/instances/') && req.method === 'DELETE') {
-    if (req.headers['x-router-secret'] !== ROUTER_SECRET) {
+    const hasRouterSecretDel = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasBridgeTokenDel = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
+    if (!hasRouterSecretDel && !hasBridgeTokenDel) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -262,11 +354,19 @@ const server = http.createServer(async (req, res) => {
 
 const knownInstances = new Set();
 
+/** Auth headers for bridge→router API calls. Prefer BRIDGE_TOKEN, fall back to ROUTER_SECRET. */
+function bridgeAuthHeaders() {
+  if (BRIDGE_TOKEN) {
+    return { 'x-bridge-token': BRIDGE_TOKEN, 'x-bridge-id': INSTANCE_ID };
+  }
+  return { 'x-router-secret': ROUTER_SECRET };
+}
+
 /** Report a dead instance to the router. */
 async function reportInstanceGone(instanceId) {
   try {
     const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/gone`, ROUTER_URL);
-    await fetch(url.toString(), { method: 'POST', headers: { 'x-router-secret': ROUTER_SECRET } });
+    await fetch(url.toString(), { method: 'POST', headers: bridgeAuthHeaders() });
     console.log(`[scanner] Reported instance gone: ${instanceId}`);
   } catch (err) {
     console.warn(`[scanner] Failed to report gone ${instanceId}: ${err.message}`);
@@ -279,7 +379,7 @@ async function reportInstanceStatus(instanceId, status) {
     const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/status`, ROUTER_URL);
     await fetch(url.toString(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-router-secret': ROUTER_SECRET },
+      headers: { 'Content-Type': 'application/json', ...bridgeAuthHeaders() },
       body: JSON.stringify({ status, bridgeId: INSTANCE_ID }),
     });
   } catch { /* best effort */ }
@@ -353,8 +453,14 @@ async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[pairing] Listening on port ${PORT}`);
-  // Fetch router config (includes secret) before registering
-  fetchRouterConfig().then(() => registerWithRetry());
+
+  if (BRIDGE_TOKEN) {
+    // Pre-provisioned: bridge was created via POST /api/bridges with user auth
+    setupPreProvisioned();
+  } else {
+    // Self-registration: bridge registers with ROUTER_SECRET
+    fetchRouterConfig().then(() => registerWithRetry());
+  }
 
   // Start compose stack scanning after a short delay
   setTimeout(() => {
