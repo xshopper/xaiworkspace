@@ -3,10 +3,10 @@
 // Minimal WS agent inside each workspace container. Connects to the router,
 // receives install/exec/uninstall commands, and executes them locally.
 //
-// Once the openclaw mini-app is installed and its own bridge.js starts, this
-// agent goes dormant (the router closes the duplicate connection).
+// Once the openclaw mini-app is installed and its workspace-agent bridge starts,
+// this agent goes dormant (the router closes the duplicate connection).
 //
-// Environment (from /etc/openclaw/secrets.env):
+// Environment (from /etc/xai/secrets.env):
 //   ROUTER_URL, INSTANCE_ID, INSTANCE_TOKEN, CHAT_ID, PORT, GW_PASSWORD
 // ─────────────────────────────────────────────────────────────────────────────
 const http = require('http');
@@ -19,7 +19,7 @@ const path = require('path');
 const WebSocket = require('ws');
 
 // Load secrets from env file
-const SECRETS_FILE = '/etc/openclaw/secrets.env';
+const SECRETS_FILE = '/etc/xai/secrets.env';
 if (fs.existsSync(SECRETS_FILE)) {
   for (const line of fs.readFileSync(SECRETS_FILE, 'utf8').split('\n')) {
     const m = line.match(/^([A-Z_]+)=(.*)$/);

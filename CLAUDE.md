@@ -54,7 +54,7 @@ bridge/
   ecosystem.config.js  # pm2 config for both processes
 workspace-base/
   bridge.js        # Bootstrap bridge for bare workspace containers (install/exec/uninstall)
-  entrypoint.sh    # Container entrypoint: writes secrets.env, patches OpenClaw gateway config after install
+  entrypoint.sh    # Container entrypoint: writes secrets.env, starts workspace agent
 bridge/
   compose-manager.js  # Docker Compose management for workspace containers
 config/
@@ -84,6 +84,8 @@ Priority: local file > router API > defaults.
 ## Security
 
 - **Secret mounting**: `ROUTER_SECRET` is written to a temp file (0600 perms) and bind-mounted into the container at `/run/secrets/router_secret` instead of passed as `-e` env var. This prevents exposure via `docker inspect`. The bridge `server.js` reads from the secret file with env var fallback.
+- **GW_PASSWORD injection-safe**: `workspace-base/entrypoint.sh` passes `GW_PASSWORD` to the Node.js config-patch script via `process.env.GW_PASSWORD` (not shell string interpolation), preventing injection via a password containing shell metacharacters.
+- **503 on missing ROUTER_SECRET**: `bridge/server.js` returns HTTP 503 (not 500) when `ROUTER_SECRET` is empty/unset, making misconfiguration distinguishable from runtime errors. All secret comparisons in `server.js` use `safeCompare()` (timing-safe, based on `crypto.timingSafeEqual`).
 - **Exec allowlists**: Both `bridge/bridge.js` and `workspace-base/bridge.js` restrict commands to allowlisted prefixes (e.g. `docker`, `node`, `pm2`, `bash scripts/`). Shell metacharacters (`;`, backticks) are blocked to prevent injection.
 - **Input validation**: User fields must be alphanumeric/dash/underscore. Working directories must be absolute paths without `..`. Commands have a 10KB length limit and 5-minute timeout.
 - **Trusted URL domains**: `workspace-base/bridge.js` only downloads artifacts/source from an allowlist of domains (github.com, registry.npmjs.org, xaiworkspace.com, etc.). Non-HTTPS and unknown domains are rejected.
@@ -139,13 +141,11 @@ macOS: Developer ID Application certificate from Apple (xShopper Pty Ltd, Team I
 ## Workspace Container Startup
 
 `workspace-base/entrypoint.sh` runs on workspace container start:
-1. Writes secrets to `/etc/openclaw/secrets.env` from container env vars
-2. Starts a background script that waits for OpenClaw install to complete (checks for `lastTouchedVersion` in `openclaw.json`)
-3. After install, patches `openclaw.json` with `gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback: true` (required for gateway to start on non-loopback interfaces)
-4. Restarts the gateway process via pm2
-5. Main process starts pm2-runtime with the bootstrap bridge
+1. Writes secrets to `/etc/xai/secrets.env` from container env vars
+2. Creates `~/apps` directory for mini-app installs
+3. Starts pm2-runtime with the workspace agent
 
-The OpenClaw gateway requires `controlUi.allowedOrigins` or the fallback flag. Without the patch, the gateway crashes with "non-loopback Control UI requires gateway.controlUi.allowedOrigins".
+OpenClaw is installed as a mini-app via the workspace agent after the container starts — it is not baked into the image. The OpenClaw mini-app's own `install.sh` handles gateway configuration.
 
 ## Related Projects
 

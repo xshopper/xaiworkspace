@@ -1,12 +1,9 @@
-use std::sync::Arc;
 use std::process::Command;
 use tauri::{
     AppHandle,
-    menu::{Menu, MenuItem, PredefinedMenuItem, CheckMenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
-use crate::oauth::OAuthManager;
-use crate::config::DesktopConfig;
 
 /// Detect if the system is using a dark theme.
 fn is_dark_theme() -> bool {
@@ -67,49 +64,19 @@ fn get_bridge_status() -> &'static str {
 }
 
 /// Set up the system tray icon and menu.
-pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> Result<(), Box<dyn std::error::Error>> {
+/// Minimal: Open website, bridge status, quit. No network activity.
+pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let open_item = MenuItem::with_id(app, "open", "Open xAI Workspace", true, None::<&str>)?;
     let bridge_item = MenuItem::with_id(app, "bridge_status", get_bridge_status(), false, None::<&str>)?;
-    let sep1 = PredefinedMenuItem::separator(app)?;
-
-    let mut oauth_items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
-    for provider in &cfg.oauth_providers {
-        let label = format!("{} (port {})", capitalize(&provider.name), provider.port);
-        let item = CheckMenuItem::with_id(
-            app, format!("oauth_{}", provider.name), &label,
-            true, true, None::<&str>,
-        )?;
-        oauth_items.push(item);
-    }
-
-    let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+    let menu = Menu::with_items(app, &[
         &open_item,
         &bridge_item,
-        &sep1,
-    ];
-    for item in &oauth_items {
-        items.push(item);
-    }
-    items.push(&sep2);
-    items.push(&quit_item);
-
-    let menu = Menu::with_items(app, &items)?;
-
-    let check_items: Vec<(String, CheckMenuItem<tauri::Wry>)> = oauth_items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| (cfg.oauth_providers[i].name.clone(), item))
-        .collect();
-    let check_items = Arc::new(check_items);
-
-    let app_url = cfg.app_url.clone();
-    let oauth_mgr = oauth.clone();
-    let items_ref = check_items.clone();
-    let bridge_status_item = bridge_item;
-    let bridge_status_for_poll = bridge_status_item.clone();
+        &sep,
+        &quit_item,
+    ])?;
 
     // Theme-aware icon
     let icon_bytes: &[u8] = if is_dark_theme() {
@@ -122,42 +89,28 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
             format!("Failed to load tray icon: {e}").into()
         })?;
 
+    let bridge_status_item = bridge_item.clone();
+
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .tooltip("xAI Workspace")
         .on_menu_event(move |app, event| {
-            let id = event.id().as_ref().to_string();
-            match id.as_str() {
+            match event.id().as_ref() {
                 "open" => {
-                    let _ = open::that(&app_url);
+                    // Open the web app — uses the default browser, no network from Tauri
+                    let _ = open::that("https://xaiworkspace.com");
                 }
-                // "restart_bridge" removed — bridge updates via version reporting + rolling deploy
                 "quit" => {
                     app.exit(0);
-                }
-                _ if id.starts_with("oauth_") => {
-                    let Some(stripped) = id.strip_prefix("oauth_") else { return; };
-                    let provider = stripped.to_string();
-                    let mgr = oauth_mgr.clone();
-                    let items = items_ref.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let is_on = mgr.toggle(&provider).await;
-                        for (name, item) in items.iter() {
-                            if name == &provider {
-                                let _ = item.set_checked(is_on);
-                                break;
-                            }
-                        }
-                    });
                 }
                 _ => {}
             }
         })
         .build(app)?;
 
-    // Periodically update bridge status (every 30s)
-    let status_item = bridge_status_for_poll;
+    // Periodically update bridge status via Docker CLI (local only, no network)
+    let status_item = bridge_status_item;
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -166,12 +119,4 @@ pub fn setup(app: &AppHandle, cfg: &DesktopConfig, oauth: Arc<OAuthManager>) -> 
     });
 
     Ok(())
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
 }

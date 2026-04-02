@@ -2,7 +2,7 @@
 name = "xaiworkspace"
 version = "0.1.0"
 edition = "2021"
-description = "xAI Workspace desktop bootstrapper — installs Docker, runs bridge, handles OAuth"
+description = "xAI Workspace desktop bootstrapper — launches bridge Docker container"
 authors = ["xAI Workspace"]
 
 [dependencies]

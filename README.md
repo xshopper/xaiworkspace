@@ -1,6 +1,6 @@
 # xAI Workspace Desktop
 
-Lightweight cross-platform system tray app that bootstraps Docker, runs the xAI Workspace bridge, and handles OAuth callbacks.
+Lightweight cross-platform system tray app that launches the xAI Workspace system bridge Docker container.
 
 ## What it does
 
@@ -89,8 +89,9 @@ Single instance guard
 ```
 
 - **Router** is the only smart component — manages users, instances, pairing codes
-- **Bridge** is a pipe — relays between router and Docker/pm2
-- **Tauri** is a bootstrapper + OAuth listener — not smart
+- **System bridge** (`bridge/`) is a pipe — relays between router and Docker, handles OAuth callbacks, auto-updates
+- **Workspace agent** (`workspace-base/`) runs inside each workspace container — installs apps, executes commands
+- **Tauri** is a launcher — starts the system bridge Docker container, sits in tray
 
 ## System tray
 

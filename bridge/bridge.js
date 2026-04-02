@@ -80,6 +80,20 @@ function connectRouter() {
         handleProvision(msg);
         return;
       }
+      // Handle update command — trigger immediate update check via PM2
+      if (msg.type === 'check_update') {
+        console.log('[bridge] Router requested update check');
+        try {
+          const { execFileSync } = require('child_process');
+          execFileSync('pm2', ['restart', 'updater'], { timeout: 10000, stdio: 'pipe' });
+          if (routerWs?.readyState === 1) {
+            routerWs.send(JSON.stringify({ type: 'update_check_started' }));
+          }
+        } catch (err) {
+          console.error('[bridge] Failed to trigger update:', err.message);
+        }
+        return;
+      }
     } catch (e) {
       console.error('[bridge] Message handler error:', e.message);
     }
