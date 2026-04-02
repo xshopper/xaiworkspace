@@ -33,7 +33,18 @@ const INSTANCE_TOKEN = process.env.INSTANCE_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const PORT = process.env.PORT || '19001';
 const HEALTH_PORT = parseInt(process.env.BRIDGE_HEALTH_PORT || '19099', 10);
-const HOME = process.env.HOME || '/home/workspace';
+
+// ── Per-user isolation ─────────────────────────────────────────────────────
+// Derive a Linux username from CHAT_ID. User apps run under this user via
+// su - (no sudo). The workspace-agent itself stays running as root.
+function deriveUsername(chatId) {
+  const sanitized = String(chatId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 28);
+  return `xai${sanitized || 'default'}`.toLowerCase();
+}
+
+const WS_USER = process.env.WS_USER || deriveUsername(CHAT_ID);
+const WS_HOME = `/home/${WS_USER}`;
+const HOME = process.env.HOME || WS_HOME;
 const APPS_DIR = path.join(HOME, 'apps');
 
 // ── Agent version (reported to router; router can trigger self-update) ─────
@@ -601,6 +612,7 @@ async function handleInstallApp(msg) {
       }
 
       await execAsync(`cp -a "${src}/." "${appDir}/"`, { timeout: 15000 });
+      await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}"`, { timeout: 15000 });
       await execAsync(`rm -rf "${tmpFile}" "${tmpDir}"`);
     } else if (sourceUrl) {
       // Convert GitHub tree URLs to sparse checkout
@@ -613,6 +625,7 @@ async function handleInstallApp(msg) {
         await execAsync('git clone --depth 1 --filter=blob:none --sparse "' + repoUrl + '" ' + tmpSparse, { timeout: 120000 });
         await execAsync('cd ' + tmpSparse + ' && git sparse-checkout set "' + ghSubdir + '"', { timeout: 30000 });
         await execAsync('cp -a ' + tmpSparse + '/' + ghSubdir + '/. ' + appDir + '/', { timeout: 15000 });
+        await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}"`, { timeout: 15000 });
         await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
       } else {
         // Clone fresh; if directory already exists from a previous install, remove it first
@@ -621,21 +634,20 @@ async function handleInstallApp(msg) {
           await execAsync(`rm -rf "${appDir}"`, { timeout: 10000 });
         }
         await execAsync(`git clone --depth 1 "${sourceUrl}" "${appDir}"`, { timeout: 120000 });
+        await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}"`, { timeout: 15000 });
       }
     }
 
-    // 3. Run install.sh if present
+    // 3. Run install.sh if present (as derived user)
     sendProgress(id, slug, 'installing', 50);
     const installScript = path.join(appDir, 'scripts', 'install.sh');
     if (fs.existsSync(installScript)) {
-      await execAsync(`bash "${installScript}"`, {
-        cwd: appDir,
-        env: { ...process.env, APP_DIR: appDir, HOME },
+      await execAsync(`su - ${WS_USER} -c 'cd "${appDir}" && APP_DIR="${appDir}" HOME="${HOME}" bash "${installScript}"'`, {
         timeout: 120000,
       });
     }
 
-    // 4. Install deps if package.json exists (using pnpm).
+    // 4. Install deps if package.json exists (using pnpm, as derived user).
     // On upgrades, always reinstall if package.json changed — stale node_modules from the
     // old version may be missing new deps or have incompatible versions.
     const pkgJson = path.join(appDir, 'package.json');
@@ -649,17 +661,15 @@ async function handleInstallApp(msg) {
           } catch { return true; }
         })());
       if (needsInstall) {
-        await execAsync('pnpm install --prod --reporter=silent', { cwd: appDir, timeout: 120000 });
+        await execAsync(`su - ${WS_USER} -c 'cd "${appDir}" && pnpm install --prod --reporter=silent'`, { timeout: 120000 });
       }
     }
 
-    // 5. Regenerate ecosystem and restart pm2
+    // 5. Regenerate ecosystem and restart pm2 (generate-ecosystem.sh as derived user)
     sendProgress(id, slug, 'starting', 80);
     const genScript = path.join(appDir, 'scripts', 'generate-ecosystem.sh');
     if (fs.existsSync(genScript)) {
-      await execAsync(`bash "${genScript}"`, {
-        cwd: appDir,
-        env: { ...process.env, APP_DIR: appDir, HOME },
+      await execAsync(`su - ${WS_USER} -c 'cd "${appDir}" && APP_DIR="${appDir}" HOME="${HOME}" bash "${genScript}"'`, {
         timeout: 30000,
       });
     }
@@ -884,12 +894,12 @@ function handleExec(msg) {
   }
 
   const { spawn } = require('child_process');
-  const args = user
-    ? ['sudo', ['-u', user, 'bash', '-c', command], { cwd: cwd || '/tmp' }]
-    : ['bash', ['-c', command], { cwd: cwd || '/tmp' }];
+  // Default to derived user — commands run as the workspace user, not root
+  const execUser = user || WS_USER;
+  const args = ['su', ['-', execUser, '-c', command], { cwd: cwd || '/tmp' }];
 
-  console.log(`[workspace-agent] exec: ${command.slice(0, 60)}... (${command.length} bytes)`);
-  const child = spawn(args[0], args[1], { ...args[2], detached: true, env: { ...process.env, HOME: `/home/${user || 'workspace'}` } });
+  console.log(`[workspace-agent] exec (user=${execUser}): ${command.slice(0, 60)}... (${command.length} bytes)`);
+  const child = spawn(args[0], args[1], { ...args[2], detached: true, env: { ...process.env, HOME: `/home/${execUser}` } });
   let stdout = '', stderr = '';
 
   child.stdout.on('data', d => { stdout += d; });

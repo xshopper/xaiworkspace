@@ -233,11 +233,14 @@ if (!containerId) {
   process.exit(0);
 }
 
-const containerImage = process.env.BRIDGE_IMAGE || getContainerImage(containerId);
-if (!containerImage) {
+// Always pull the -latest tag to detect updates, regardless of what versioned tag
+// this container was created from (e.g. bridge-v0.3.0 → pull bridge-latest).
+const rawImage = process.env.BRIDGE_IMAGE || getContainerImage(containerId);
+if (!rawImage) {
   console.error('[updater] Cannot determine container image');
   process.exit(0);
 }
+const containerImage = rawImage.replace(/:bridge.*$/, ':bridge-latest');
 
 const containerName = (() => {
   try {
@@ -250,17 +253,29 @@ const containerName = (() => {
 console.log(`[updater] Monitoring ${containerImage} for updates (every ${CHECK_INTERVAL_MIN}min)`);
 console.log(`[updater] Container: ${containerName || containerId}`);
 
-const startDigest = getLocalDigest(containerImage);
-console.log(`[updater] Current digest: ${startDigest || 'unknown'}`);
+// Get the image ID that this container is actually running
+const runningImageId = (() => {
+  try {
+    return execFileSync('docker', ['inspect', '--format', '{{.Image}}', containerId],
+      { encoding: 'utf-8', timeout: 5000 }).trim();
+  } catch { return null; }
+})();
+console.log(`[updater] Running image: ${runningImageId || 'unknown'}`);
 
 async function checkForUpdate() {
   console.log(`[updater] Checking for update...`);
 
-  const beforeDigest = getLocalDigest(containerImage);
   if (!pullImage(containerImage)) return;
-  const afterDigest = getLocalDigest(containerImage);
 
-  if (!beforeDigest || !afterDigest || beforeDigest === afterDigest) {
+  // Compare the running container's image ID against the pulled image ID
+  const pulledImageId = (() => {
+    try {
+      return execFileSync('docker', ['inspect', '--format', '{{.Id}}', containerImage],
+        { encoding: 'utf-8', timeout: 5000 }).trim();
+    } catch { return null; }
+  })();
+
+  if (!runningImageId || !pulledImageId || runningImageId === pulledImageId) {
     console.log(`[updater] Image is up to date`);
     return;
   }
