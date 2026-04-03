@@ -326,6 +326,7 @@ async function registerBridge() {
         region: process.env.REGION || 'local',
         provider: process.env.PROVIDER || 'local',
         version: require('./package.json').version,
+        osType: process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux',
       }),
     });
 
