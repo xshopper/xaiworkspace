@@ -239,49 +239,69 @@ function handleProvision(msg) {
 
   console.log(`[bridge] Provisioning workspace: ${instanceId} (image: ${safeImage})`);
 
-  try {
-    const args = ['run', '-d', '--name', instanceId, '--restart', 'unless-stopped'];
+  const sendProgress = (stage, message) => {
+    if (routerWs?.readyState === WebSocket.OPEN) {
+      routerWs.send(JSON.stringify({ type: 'provision_progress', instanceId, stage, message }));
+    }
+  };
 
-    // Pass environment variables with validation
-    if (env) {
-      for (const [k, v] of Object.entries(env)) {
-        if (!ENV_KEY_RE.test(k)) {
-          console.warn(`[bridge] Provision: skipping invalid env key: ${k}`);
-          continue;
+  // Run provisioning async so we can send progress events
+  (async () => {
+    try {
+      // Step 1: Pull image
+      sendProgress('pulling', 'Pulling image...');
+      try {
+        execFileSync('docker', ['pull', safeImage], { timeout: 300_000, stdio: 'pipe' });
+      } catch (pullErr) {
+        console.warn(`[bridge] Image pull failed/skipped for ${safeImage}: ${pullErr.stderr?.toString().trim() || pullErr.message}`);
+        // Continue — image may be cached locally
+      }
+
+      // Step 2: Create and start container
+      sendProgress('starting', 'Starting container...');
+      const args = ['run', '-d', '--name', instanceId, '--restart', 'unless-stopped'];
+
+      if (env) {
+        for (const [k, v] of Object.entries(env)) {
+          if (!ENV_KEY_RE.test(k)) {
+            console.warn(`[bridge] Provision: skipping invalid env key: ${k}`);
+            continue;
+          }
+          const val = String(v);
+          if (ENV_VAL_FORBIDDEN_RE.test(val)) {
+            console.warn(`[bridge] Provision: skipping env ${k} with forbidden control chars`);
+            continue;
+          }
+          args.push('-e', `${k}=${val}`);
         }
-        const val = String(v);
-        if (ENV_VAL_FORBIDDEN_RE.test(val)) {
-          console.warn(`[bridge] Provision: skipping env ${k} with forbidden control chars`);
-          continue;
-        }
-        args.push('-e', `${k}=${val}`);
+      }
+      args.push(safeImage);
+
+      execFileSync('docker', args, { timeout: 60_000, stdio: 'pipe' });
+      console.log(`[bridge] Workspace ${instanceId} started`);
+
+      // Step 4: Done
+      sendProgress('ready', 'Instance is ready');
+      if (routerWs?.readyState === WebSocket.OPEN) {
+        routerWs.send(JSON.stringify({
+          type: 'provision_result',
+          instanceId,
+          status: 'started',
+        }));
+      }
+    } catch (err) {
+      console.error(`[bridge] Provision failed for ${instanceId}:`, err.message);
+      sendProgress('failed', err.message);
+      if (routerWs?.readyState === WebSocket.OPEN) {
+        routerWs.send(JSON.stringify({
+          type: 'provision_result',
+          instanceId,
+          status: 'failed',
+          error: err.message,
+        }));
       }
     }
-
-    args.push(safeImage);
-
-    execFileSync('docker', args, { timeout: 60_000 });
-    console.log(`[bridge] Workspace ${instanceId} started`);
-
-    // Notify router
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({
-        type: 'provision_result',
-        instanceId,
-        status: 'started',
-      }));
-    }
-  } catch (err) {
-    console.error(`[bridge] Provision failed for ${instanceId}:`, err.message);
-    if (routerWs?.readyState === WebSocket.OPEN) {
-      routerWs.send(JSON.stringify({
-        type: 'provision_result',
-        instanceId,
-        status: 'failed',
-        error: err.message,
-      }));
-    }
-  }
+  })();
 }
 
 // ── Exec: run commands locally, stream output back to router ──────────────
