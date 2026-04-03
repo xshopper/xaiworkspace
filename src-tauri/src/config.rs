@@ -30,14 +30,35 @@ impl Default for DesktopConfig {
     }
 }
 
-/// Load config: local file > defaults. No network calls.
+/// Load config: local file > router API > defaults.
 pub fn load() -> DesktopConfig {
     if let Some(local) = load_local_file() {
         println!("[config] Loaded from local file: {}", local_config_path().display());
         return local;
     }
-    println!("[config] Using defaults");
-    DesktopConfig::default()
+    // Try fetching from router to get the latest bridge image version
+    let defaults = DesktopConfig::default();
+    match fetch_router_config(&defaults.router_url) {
+        Some(remote) => {
+            println!("[config] Loaded from router: {}", defaults.router_url);
+            remote
+        }
+        None => {
+            println!("[config] Using defaults");
+            defaults
+        }
+    }
+}
+
+/// Fetch config from router's /api/config/desktop endpoint.
+fn fetch_router_config(router_url: &str) -> Option<DesktopConfig> {
+    let url = format!("{}/api/config/desktop", router_url.trim_end_matches('/'));
+    let output = std::process::Command::new("curl")
+        .args(["-sf", "--max-time", "5", &url])
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Path to local config file — next to the executable or in working dir.
