@@ -90,6 +90,23 @@ function writeComposeFile(chatId) {
     }
     yaml += '\n';
   }
+  // Declare named volumes used by services
+  const namedVolumes = new Set();
+  for (const [, config] of services) {
+    for (const v of (config.volumes || [])) {
+      const src = v.split(':')[0];
+      // Named volumes don't start with / or . (bind mounts do)
+      if (src && !src.startsWith('/') && !src.startsWith('.') && !src.startsWith('~')) {
+        namedVolumes.add(src);
+      }
+    }
+  }
+  if (namedVolumes.size > 0) {
+    yaml += 'volumes:\n';
+    for (const vol of namedVolumes) {
+      yaml += `  ${vol}:\n`;
+    }
+  }
   yaml += `networks:\n  default:\n    name: "${yamlEscape(NETWORK_NAME)}"\n    external: true\n`;
   const filePath = composeFilePath(chatId);
   fs.writeFileSync(filePath, yaml);

@@ -1,1 +1,1 @@
-{"name":"xaiworkspace-bridge","version":"0.13.1","private":true,"dependencies":{"ws":"^8.18.0"}}
+{"name":"xaiworkspace-bridge","version":"0.14.0","private":true,"dependencies":{"ws":"^8.18.0"}}
