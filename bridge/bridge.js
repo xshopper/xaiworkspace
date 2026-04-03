@@ -208,6 +208,34 @@ function connectRouter() {
   }, 30000);
 }
 
+// ── Update progress forwarding ────────────────────────────────────────────
+// The updater.js process writes progress to /data/update_progress.
+// We watch the file and forward changes to the router over WS.
+
+const UPDATE_PROGRESS_FILE = '/data/update_progress';
+let lastUpdateProgressTs = 0;
+
+setInterval(() => {
+  try {
+    const raw = fs.readFileSync(UPDATE_PROGRESS_FILE, 'utf8');
+    const progress = JSON.parse(raw);
+    if (progress.ts && progress.ts > lastUpdateProgressTs) {
+      lastUpdateProgressTs = progress.ts;
+      if (routerWs?.readyState === WebSocket.OPEN) {
+        routerWs.send(JSON.stringify({
+          type: 'bridge_update_progress',
+          stage: progress.stage,
+          message: progress.message,
+        }));
+      }
+      // Clean up on terminal stages
+      if (progress.stage === 'updated' || progress.stage === 'failed' || progress.stage === 'idle') {
+        try { fs.unlinkSync(UPDATE_PROGRESS_FILE); } catch {}
+      }
+    }
+  } catch { /* file doesn't exist or parse error — ignore */ }
+}, 2000);
+
 // ── Provision: create a workspace container via Docker ────────────────────
 
 // Validate env var key/value: keys must be alphanumeric/underscore, values must not contain control chars

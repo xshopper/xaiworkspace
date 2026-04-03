@@ -51,6 +51,15 @@ process.on('SIGINT', () => process.exit(0));
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+const UPDATE_PROGRESS_FILE = '/data/update_progress';
+
+/** Write update progress to a file — bridge.js watches and forwards to router. */
+function sendUpdateProgress(stage, message) {
+  try {
+    fs.writeFileSync(UPDATE_PROGRESS_FILE, JSON.stringify({ stage, message, ts: Date.now() }));
+  } catch { /* best effort */ }
+}
+
 /**
  * Get this container's own container ID.
  */
@@ -264,8 +273,12 @@ console.log(`[updater] Running image: ${runningImageId || 'unknown'}`);
 
 async function checkForUpdate() {
   console.log(`[updater] Checking for update...`);
+  sendUpdateProgress('checking', 'Checking for updates...');
 
-  if (!pullImage(containerImage)) return;
+  if (!pullImage(containerImage)) {
+    sendUpdateProgress('idle', 'Update check failed');
+    return;
+  }
 
   // Compare the running container's image ID against the pulled image ID
   const pulledImageId = (() => {
@@ -283,34 +296,47 @@ async function checkForUpdate() {
   console.log(`[updater] New image detected!`);
   console.log(`[updater]   Old: ${beforeDigest}`);
   console.log(`[updater]   New: ${afterDigest}`);
+  sendUpdateProgress('detected', 'New bridge version detected');
 
   const config = getContainerConfig(containerId);
   if (!config) {
     console.error('[updater] Cannot read container config — skipping update');
+    sendUpdateProgress('failed', 'Cannot read container config');
     return;
   }
 
   if (!containerName) {
     console.error('[updater] Cannot determine container name — skipping update');
+    sendUpdateProgress('failed', 'Cannot determine container name');
     return;
   }
 
   // Create the replacement container (not started — ports still held by old container)
+  sendUpdateProgress('creating', 'Creating replacement container...');
   const replacement = startReplacement(config, containerImage);
-  if (!replacement) return;
+  if (!replacement) {
+    sendUpdateProgress('failed', 'Failed to create replacement container');
+    return;
+  }
 
   // Swap: stop old → rename → start new (brief downtime while ports transfer)
+  sendUpdateProgress('swapping', 'Swapping containers...');
   console.log(`[updater] Swapping containers...`);
   const swapped = swapContainers(containerName, containerId, replacement.name, replacement.id);
-  if (!swapped) return;
+  if (!swapped) {
+    sendUpdateProgress('failed', 'Container swap failed');
+    return;
+  }
 
   // Wait for the new container to become healthy after starting
+  sendUpdateProgress('starting', 'Waiting for new container to become healthy...');
   console.log(`[updater] Waiting for new container to become healthy...`);
   const healthy = await waitForHealthy(replacement.id, 120000);
   if (!healthy) {
     console.error(`[updater] New container unhealthy after swap — manual intervention needed`);
-    // Don't rollback automatically — the old container is already stopped and renamed
-    // The new container is running under the original name. Admin should check logs.
+    sendUpdateProgress('failed', 'New container unhealthy after swap');
+  } else {
+    sendUpdateProgress('updated', 'Bridge updated successfully');
   }
   // The old container (us) is now stopped — this process dies
 }
