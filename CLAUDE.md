@@ -24,6 +24,15 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg
 docker build -f Dockerfile.bridge -t xaiworkspace-bridge:latest .
 ```
 
+### Publishing the bridge image to ECR
+
+```bash
+./scripts/push-bridge.sh              # Build, tag bridge-vX.Y.Z + bridge-latest, push to ECR, notify routers
+./scripts/push-bridge.sh --skip-build # Push only (image already built locally)
+```
+
+The script reads the version from `bridge/package.json`, tags the image as both `bridge-vX.Y.Z` and `bridge-latest`, pushes to `public.ecr.aws/s3b3q6t2/xaiworkspace-docker`, then calls `POST /api/webhooks/ecr-push` on each router (test + prod) to trigger an immediate version refresh. Set `ECR_WEBHOOK_SECRET` in the environment for router notification; omit to skip the notification step.
+
 ## Architecture
 
 | Component | Role | Code |
@@ -94,18 +103,19 @@ Priority: local file > router API > defaults.
 
 ```
 1. Load config (local file > router > defaults)
-2. Set up tray with OAuth toggles
-3. Check Docker → install if missing (platform-specific, elevated)
-4. Check bridge container → pull image + create if missing
-5. Wait for health (localhost:3100/health)
-6. Open browser (bridge redirects to /link?code=XXXX for pairing)
-7. Hide window → tray
-8. Start OAuth listeners (all on, skip ports bound by bridge)
+2. Fetch versioned bridge image tag from GET /api/config/desktop
+3. Set up tray with OAuth toggles
+4. Check Docker → install if missing (platform-specific, elevated)
+5. Check bridge container → pull versioned image + create if missing (with PAIRING_CODE)
+6. Wait for health (localhost:3100/health)
+7. Open browser (bridge redirects to /link?code=XXXX for pairing)
+8. Hide window → tray
+9. Start OAuth listeners (all on, skip ports bound by bridge)
 ```
 
 ## Bridge Container
 
-Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest`
+Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-v<version>` (versioned tag — not `:latest`). The current version is fetched from `GET /api/config/desktop` at Tauri startup and used in all `docker run` commands.
 
 Runs two pm2 processes:
 - `pairing-server` (server.js) — health endpoint + pairing code redirect on port 3100. Registers bridge with router, writes auth credentials to `/data/auth.json`.
@@ -114,6 +124,16 @@ Runs two pm2 processes:
 Ports mapped: 3100 (pairing), 54545 (Claude OAuth), 8085 (Gemini), 1455 (Codex)
 
 Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind mount from host temp file). `server.js` reads secret file first, falls back to env var.
+
+**Auto-discovery flow**: When started with `PAIRING_CODE` env var, the bridge calls `POST /api/bridges/claim-device` to exchange the code (5-min TTL) for a unique `bridgeId` + `bridgeToken`. After connecting to the router WS, the router sends `scan_bridges`; the bridge scans Docker for sibling bridge containers and reports back. Router responds with `bridge_adopt` (join existing stack) or `bridge_primary` (recreate with mapped ports).
+
+**OS detection**: Bridge queries Docker API `/info` at startup to detect host OS — `linuxkit` kernel → macOS, `WSL` in OS name → Windows, otherwise Linux. Reported to router on self-registration.
+
+**Instance WS commands**: Bridge handles `start_instance`, `stop_instance`, `remove_instance`, and `stop_orphan` commands sent from the router via WS (bridge v0.19.0+). No direct Docker CLI calls from the frontend.
+
+**Provisioning progress**: Bridge emits `instance_provision_progress` events (`pulling` → `starting` → `ready`) during workspace container creation, and `bridge_provision_progress` events during bridge container setup. Both are forwarded to the frontend via router WS.
+
+**Auto-updater**: Checks ECR for a newer bridge image every 30 minutes. Forwards update progress as `bridge_update_progress` WS events. Skipped on ephemeral `PAIRING_CODE` containers.
 
 **E2E tests**: `bridge-domain-connection.spec.ts` (20 tests, desktop + mobile) — validates bridge connects to real domain (not localhost), authenticates, appears as connected in Settings page.
 
