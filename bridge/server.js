@@ -41,10 +41,11 @@ if (!ROUTER_SECRET) {
   console.warn('[config] WARNING: ROUTER_SECRET not set (checked env var and /run/secrets/router_secret)');
 }
 // BRIDGE_ID is the preferred name (from POST /api/bridges), INSTANCE_ID is the legacy fallback
-const INSTANCE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || `xaiw-bridge-${crypto.randomBytes(8).toString('hex')}`;
-// BRIDGE_TOKEN: when set, bridge was pre-provisioned via POST /api/bridges (user-authenticated).
-// Skip self-registration and use the token directly for WS auth.
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+let INSTANCE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || '';
+// BRIDGE_TOKEN: permanent credential for WS auth (resolved from pairing code or set directly).
+let BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+// PAIRING_CODE: short-lived code to claim credentials from the router (replaces BRIDGE_TOKEN in docker command).
+const PAIRING_CODE = process.env.PAIRING_CODE || '';
 const BRIDGE_VERSION = require('./package.json').version;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
@@ -609,6 +610,39 @@ async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
 
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[pairing] Bridge v${BRIDGE_VERSION} listening on port ${PORT}`);
+
+  // ── Pairing code resolution ──────────────────────────────────────────
+  // If started with PAIRING_CODE (from docker command), resolve credentials from router.
+  if (PAIRING_CODE && !BRIDGE_TOKEN) {
+    console.log(`[pairing] Resolving credentials from pairing code ${PAIRING_CODE}...`);
+    try {
+      const url = new URL('/api/bridges/claim-device', ROUTER_URL);
+      const osType = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux';
+      const resp = await fetch(url.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: PAIRING_CODE, osType, version: BRIDGE_VERSION }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: resp.statusText }));
+        console.error(`[pairing] Failed to resolve pairing code: ${err.error}`);
+        console.error('[pairing] The pairing code may have expired. Generate a new one from the app.');
+        process.exit(1);
+      }
+      const data = await resp.json();
+      INSTANCE_ID = data.bridgeId;
+      BRIDGE_TOKEN = data.bridgeToken;
+      console.log(`[pairing] Resolved: bridge=${INSTANCE_ID}`);
+    } catch (err) {
+      console.error(`[pairing] Failed to contact router: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  // Generate a random ID if none resolved
+  if (!INSTANCE_ID) {
+    INSTANCE_ID = `xaiw-bridge-${crypto.randomBytes(8).toString('hex')}`;
+  }
 
   if (BRIDGE_TOKEN) {
     // Pre-provisioned: bridge was created via POST /api/bridges with user auth
