@@ -9,6 +9,7 @@
 //   AUTH_JSON   — JSON string: { type: 'gateway_auth', instanceId, instanceToken }
 // ─────────────────────────────────────────────────────────────────────────────
 const WebSocket = require('ws');
+const http = require('http');
 const fs = require('fs');
 
 // Derive ROUTER_WS from ROUTER_URL if not explicitly set
@@ -31,6 +32,62 @@ let routerWs = null;
 let authenticated = false;
 let shuttingDown = false;
 let pingInterval = null;
+
+const BRIDGE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || '';
+
+// ── Docker API (scan for other bridges) ───────────────────────────────────
+
+function dockerApiGet(path) {
+  return new Promise((resolve) => {
+    const req = http.request({ socketPath: '/var/run/docker.sock', path, method: 'GET' }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) { resolve(null); return; }
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+/**
+ * Scan Docker for other bridge containers.
+ * Returns array of bridge IDs found on this Docker host.
+ */
+async function scanDockerForBridges() {
+  const containers = await dockerApiGet('/containers/json');
+  if (!containers || !Array.isArray(containers)) return [];
+
+  const selfHostname = require('os').hostname();
+  const bridges = [];
+
+  for (const c of containers) {
+    // Skip self
+    if (c.Id?.startsWith(selfHostname)) continue;
+    const containerName = c.Names?.[0]?.replace(/^\//, '') || '';
+    if (containerName === BRIDGE_ID) continue;
+    if (c.State !== 'running') continue;
+    // Must expose port 3100 internally
+    if (!c.Ports?.some(p => p.PrivatePort === 3100)) continue;
+
+    // Get BRIDGE_ID from env vars
+    const inspect = await dockerApiGet(`/containers/${c.Id}/json`);
+    if (!inspect?.Config?.Env) continue;
+    const bridgeIdEnv = inspect.Config.Env.find(e => e.startsWith('BRIDGE_ID='));
+    const candidateId = bridgeIdEnv ? bridgeIdEnv.slice('BRIDGE_ID='.length) : containerName;
+    if (candidateId === BRIDGE_ID) continue;
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(candidateId)) continue;
+
+    console.log(`[bridge] Found bridge on same host: ${candidateId} (${c.Id.slice(0, 12)})`);
+    bridges.push(candidateId);
+  }
+
+  console.log(`[bridge] Scan complete: ${bridges.length} other bridge(s) found`);
+  return bridges;
+}
 
 // ── Router connection ──────────────────────────────────────────────────────
 function connectRouter() {
@@ -78,6 +135,42 @@ function connectRouter() {
       // Handle provision command — create a workspace container
       if (msg.type === 'provision_instance' && msg.instanceId) {
         handleProvision(msg);
+        return;
+      }
+      // Handle scan_bridges — router asks us to scan Docker for other bridges
+      if (msg.type === 'scan_bridges') {
+        console.log('[bridge] Router requested bridge scan');
+        scanDockerForBridges().then(bridges => {
+          if (routerWs?.readyState === WebSocket.OPEN) {
+            routerWs.send(JSON.stringify({ type: 'scan_bridges_result', bridges }));
+          }
+        });
+        return;
+      }
+      // Handle bridge_adopt — router found an existing bridge on same host
+      if (msg.type === 'bridge_adopt') {
+        console.log('');
+        console.log('══════════════════════════════════════');
+        console.log('  Existing bridge found!');
+        console.log(`  Joined: ${msg.targetBridgeId}`);
+        if (msg.pairingCode) {
+          console.log(`  Pairing code: ${msg.pairingCode}`);
+        }
+        console.log('  You are now connected.');
+        console.log('══════════════════════════════════════');
+        console.log('');
+        // Exit — container started with --rm will clean up
+        setTimeout(() => process.exit(0), 1000);
+        return;
+      }
+      // Handle bridge_primary — no existing bridge, become the primary
+      if (msg.type === 'bridge_primary') {
+        console.log('[bridge] Router confirmed: this is the primary bridge');
+        // If running without host port bindings, recreate with ports
+        // Signal server.js to handle port re-creation via the shared file system
+        try {
+          fs.writeFileSync('/data/bridge_primary', 'true');
+        } catch { /* best effort */ }
         return;
       }
       // Handle update command — trigger immediate update check via PM2

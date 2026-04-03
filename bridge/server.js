@@ -49,6 +49,169 @@ const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
 
+// ── Docker API helpers (via unix socket) ──────────────────────────────────
+// Used for port re-creation when router instructs this bridge to become primary.
+
+function dockerApiGet(path) {
+  return new Promise((resolve) => {
+    const options = { socketPath: '/var/run/docker.sock', path, method: 'GET' };
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) { resolve(null); return; }
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+function dockerApiPost(path, jsonBody) {
+  return new Promise((resolve) => {
+    const body = jsonBody ? JSON.stringify(jsonBody) : '';
+    const headers = jsonBody
+      ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      : {};
+    const req = http.request({
+      socketPath: '/var/run/docker.sock', path, method: 'POST', headers,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, body: null }); }
+      });
+    });
+    req.on('error', () => resolve({ status: 0, body: null }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ status: 0, body: null }); });
+    req.end(body);
+  });
+}
+
+function dockerApiDelete(path) {
+  return new Promise((resolve) => {
+    const req = http.request({
+      socketPath: '/var/run/docker.sock', path, method: 'DELETE',
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode }));
+    });
+    req.on('error', () => resolve({ status: 0 }));
+    req.setTimeout(5000, () => { req.destroy(); resolve({ status: 0 }); });
+    req.end();
+  });
+}
+
+// Ports required for OAuth callbacks and pairing redirect
+const BRIDGE_PORTS = [
+  { container: 3100, host: 3100 },   // pairing server
+  { container: 54545, host: 54545 }, // Claude OAuth
+  { container: 8085, host: 8085 },   // Gemini OAuth
+  { container: 1455, host: 1455 },   // Codex OAuth
+];
+
+/** Check if this container was started without host port bindings. */
+async function needsPortBindings() {
+  const hostname = require('os').hostname();
+  const inspect = await dockerApiGet(`/containers/${hostname}/json`);
+  if (!inspect) return false;
+  if (!inspect.HostConfig?.PortBindings) return true;
+  const bindings = inspect.HostConfig.PortBindings['3100/tcp'];
+  return !bindings || bindings.length === 0;
+}
+
+/**
+ * Re-create this container with host port bindings.
+ * Called when router sends bridge_primary and container has no ports.
+ * Returns false on failure; on success the process is killed (never returns).
+ */
+async function recreateWithPorts() {
+  const hostname = require('os').hostname();
+  const inspect = await dockerApiGet(`/containers/${hostname}/json`);
+  if (!inspect) {
+    console.error('[bridge] Cannot inspect self — continuing without ports');
+    return false;
+  }
+
+  console.log('[bridge] Becoming primary — re-creating with port bindings...');
+
+  const portBindings = {};
+  const exposedPorts = {};
+  for (const p of BRIDGE_PORTS) {
+    const key = `${p.container}/tcp`;
+    exposedPorts[key] = {};
+    portBindings[key] = [{ HostPort: String(p.host) }];
+  }
+
+  const createBody = {
+    Image: inspect.Config.Image,
+    Env: inspect.Config.Env,
+    ExposedPorts: { ...inspect.Config.ExposedPorts, ...exposedPorts },
+    HostConfig: {
+      ...inspect.HostConfig,
+      AutoRemove: false,
+      PortBindings: portBindings,
+      RestartPolicy: { Name: 'unless-stopped' },
+      Binds: inspect.HostConfig.Binds,
+    },
+    Healthcheck: inspect.Config.Healthcheck,
+  };
+
+  const originalName = inspect.Name.replace(/^\//, '');
+  const tempName = `${originalName}-replacing`;
+
+  // Clean up stale temp container from a previous crashed attempt
+  await dockerApiDelete(`/containers/${encodeURIComponent(tempName)}?force=true`);
+
+  // Rename self to temp name, then stop to release ports
+  const renameResp = await dockerApiPost(`/containers/${inspect.Id}/rename?name=${encodeURIComponent(tempName)}`);
+  if (renameResp.status !== 204 && renameResp.status !== 200) {
+    console.error(`[bridge] Failed to rename self: ${renameResp.status} ${renameResp.body?.message || ''}`);
+    return false;
+  }
+
+  // Stop old container to release host ports before creating the new one
+  await dockerApiPost(`/containers/${inspect.Id}/stop`);
+
+  // Create new container with original name and port bindings
+  const createResp = await dockerApiPost(
+    `/containers/create?name=${encodeURIComponent(originalName)}`,
+    createBody,
+  );
+
+  if (createResp.status !== 201 || !createResp.body?.Id) {
+    const errMsg = createResp.body?.message || '';
+    if (/port is already allocated|address already in use/i.test(errMsg)) {
+      console.warn(`[bridge] Host port conflict: ${errMsg}`);
+    } else {
+      console.error(`[bridge] Failed to create ported container: ${createResp.status} ${errMsg}`);
+    }
+    // Rollback: restart and rename back
+    await dockerApiPost(`/containers/${inspect.Id}/start`);
+    await dockerApiPost(`/containers/${inspect.Id}/rename?name=${encodeURIComponent(originalName)}`);
+    return false;
+  }
+
+  const newId = createResp.body.Id;
+  await dockerApiPost(`/containers/${newId}/start`);
+
+  console.log('');
+  console.log('══════════════════════════════════════');
+  console.log('  New bridge created!');
+  console.log(`  Ports: ${BRIDGE_PORTS.map(p => p.host).join(', ')}`);
+  console.log(`  Container: ${newId.slice(0, 12)}`);
+  console.log('  Bridge is running in the background.');
+  console.log('══════════════════════════════════════');
+  console.log('');
+
+  // Delete old (stopped) container
+  await dockerApiDelete(`/containers/${inspect.Id}?force=true`);
+  process.exit(0);
+}
+
 // Allowed CORS origins — restrict to known app URLs and localhost for dev
 const ALLOWED_ORIGINS = new Set([
   APP_URL,
@@ -451,12 +614,36 @@ async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
   setTimeout(slowPoll, slowPollMs);
 }
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[pairing] Listening on port ${PORT}`);
 
   if (BRIDGE_TOKEN) {
     // Pre-provisioned: bridge was created via POST /api/bridges with user auth
-    setupPreProvisioned();
+    await setupPreProvisioned();
+
+    // Watch for bridge_primary signal from bridge.js (router instructed us to become primary)
+    // If we have no host ports, recreate with ports in the background
+    let recreating = false;
+    const primaryCheckInterval = setInterval(async () => {
+      if (recreating) return;
+      if (!fs.existsSync('/data/bridge_primary')) return;
+      if (await needsPortBindings()) {
+        console.log('[bridge] Router confirmed primary — recreating with port bindings...');
+        recreating = true;
+        const ok = await recreateWithPorts();
+        recreating = false;
+        if (ok !== false) {
+          // Success — delete signal file, new container is running
+          try { fs.unlinkSync('/data/bridge_primary'); } catch {}
+          return;
+        }
+        // Recreation failed — keep signal file so interval retries
+        console.log('[bridge] Port binding failed, will retry');
+      } else {
+        try { fs.unlinkSync('/data/bridge_primary'); } catch {}
+        clearInterval(primaryCheckInterval); // already has ports, stop checking
+      }
+    }, 1000);
   } else {
     // Self-registration: bridge registers with ROUTER_SECRET
     fetchRouterConfig().then(() => registerWithRetry());
