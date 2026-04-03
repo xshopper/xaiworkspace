@@ -444,7 +444,7 @@ function handleExec(msg) {
 
   // Block shell metacharacters that enable command injection.
   // Note: curly braces are intentionally allowed for docker --format '{{.Names}}' patterns.
-  if (/[;`|$()><]/.test(command)) {
+  if (/[;`|$()><&]/.test(command)) {
     console.warn(`[bridge] exec rejected: disallowed shell characters: ${command.slice(0, 80)}`);
     sendResult(-1, '', 'Command rejected: disallowed characters');
     return;
