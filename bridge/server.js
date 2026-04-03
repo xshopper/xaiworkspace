@@ -614,27 +614,44 @@ server.listen(PORT, '0.0.0.0', async () => {
   // ── Pairing code resolution ──────────────────────────────────────────
   // If started with PAIRING_CODE (from docker command), resolve credentials from router.
   if (PAIRING_CODE && !BRIDGE_TOKEN) {
-    console.log(`[pairing] Resolving credentials from pairing code ${PAIRING_CODE}...`);
-    try {
-      const url = new URL('/api/bridges/claim-device', ROUTER_URL);
-      const osType = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux';
-      const resp = await fetch(url.toString(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: PAIRING_CODE, osType, version: BRIDGE_VERSION }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: resp.statusText }));
-        console.error(`[pairing] Failed to resolve pairing code: ${err.error}`);
-        console.error('[pairing] The pairing code may have expired. Generate a new one from the app.');
-        process.exit(1);
+    const osType = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux';
+    let resolved = false;
+    for (let attempt = 1; attempt <= 10 && !resolved; attempt++) {
+      console.log(`[pairing] Resolving credentials from pairing code ${PAIRING_CODE}... (attempt ${attempt})`);
+      try {
+        const url = new URL('/api/bridges/claim-device', ROUTER_URL);
+        const resp = await fetch(url.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: PAIRING_CODE, osType, version: BRIDGE_VERSION }),
+        });
+        if (resp.status === 429) {
+          console.warn('[pairing] Rate limited — retrying in 5s...');
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
+        if (resp.status === 410) {
+          console.error('[pairing] Pairing code has expired. Generate a new one from the app.');
+          process.exit(1);
+        }
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ error: resp.statusText }));
+          console.error(`[pairing] Failed to resolve pairing code: ${err.error}`);
+          await new Promise(r => setTimeout(r, 3000));
+          continue;
+        }
+        const data = await resp.json();
+        INSTANCE_ID = data.bridgeId;
+        BRIDGE_TOKEN = data.bridgeToken;
+        resolved = true;
+        console.log(`[pairing] Resolved: bridge=${INSTANCE_ID}`);
+      } catch (err) {
+        console.error(`[pairing] Failed to contact router: ${err.message}`);
+        await new Promise(r => setTimeout(r, 5000));
       }
-      const data = await resp.json();
-      INSTANCE_ID = data.bridgeId;
-      BRIDGE_TOKEN = data.bridgeToken;
-      console.log(`[pairing] Resolved: bridge=${INSTANCE_ID}`);
-    } catch (err) {
-      console.error(`[pairing] Failed to contact router: ${err.message}`);
+    }
+    if (!resolved) {
+      console.error('[pairing] Could not resolve pairing code after 10 attempts.');
       process.exit(1);
     }
   }
