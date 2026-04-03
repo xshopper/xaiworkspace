@@ -31,6 +31,11 @@ if (!ENABLED) {
   process.exit(0);
 }
 
+// Skip updater for ephemeral containers started with PAIRING_CODE (they exit after setup)
+if (process.env.PAIRING_CODE && !process.env.BRIDGE_TOKEN) {
+  process.exit(0);
+}
+
 // Concurrency guard — only one updater runs at a time
 if (fs.existsSync(LOCK_FILE)) {
   try {
