@@ -45,6 +45,7 @@ const INSTANCE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || `xaiw-br
 // BRIDGE_TOKEN: when set, bridge was pre-provisioned via POST /api/bridges (user-authenticated).
 // Skip self-registration and use the token directly for WS auth.
 const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+const BRIDGE_VERSION = require('./package.json').version;
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
@@ -606,7 +607,7 @@ async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
 }
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`[pairing] Listening on port ${PORT}`);
+  console.log(`[pairing] Bridge v${BRIDGE_VERSION} listening on port ${PORT}`);
 
   if (BRIDGE_TOKEN) {
     // Pre-provisioned: bridge was created via POST /api/bridges with user auth
