@@ -173,6 +173,21 @@ function connectRouter() {
         } catch { /* best effort */ }
         return;
       }
+      // Handle stop_orphan — router tells us to stop an orphaned workspace container
+      if (msg.type === 'stop_orphan' && msg.instanceId) {
+        const orphanId = msg.instanceId;
+        if (!/^[a-zA-Z0-9_-]+$/.test(orphanId)) return;
+        console.log(`[bridge] Stopping orphaned instance: ${orphanId}`);
+        try {
+          const { execFileSync } = require('child_process');
+          execFileSync('docker', ['stop', '-t', '5', orphanId], { timeout: 15000, stdio: 'pipe' });
+          execFileSync('docker', ['rm', orphanId], { timeout: 10000, stdio: 'pipe' });
+          console.log(`[bridge] Removed orphaned instance: ${orphanId}`);
+        } catch (err) {
+          console.warn(`[bridge] Failed to stop orphan ${orphanId}: ${err.message}`);
+        }
+        return;
+      }
       // Handle update command — trigger immediate update check via PM2
       if (msg.type === 'check_update') {
         console.log('[bridge] Router requested update check');
