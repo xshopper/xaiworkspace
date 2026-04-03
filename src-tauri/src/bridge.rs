@@ -149,7 +149,7 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
 
         Command::new("docker")
             .args([
-                "run", "-d",
+                "run", "-d", "--pull", "always",
                 "--name", name,
                 "--network", &network,
                 "--restart", "unless-stopped",
@@ -163,10 +163,10 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
             .status()
             .map_err(|e| format!("Failed to create bridge: {e}"))?
     } else {
-        // Standalone mode: image already pulled at the top
+        // Standalone mode
         Command::new("docker")
             .args([
-                "run", "-d",
+                "run", "-d", "--pull", "always",
                 "--name", name,
                 "--restart", "unless-stopped",
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
