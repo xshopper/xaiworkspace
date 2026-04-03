@@ -178,6 +178,30 @@ function connectRouter() {
         } catch { /* best effort */ }
         return;
       }
+      // Handle start_instance — router tells us to start a stopped workspace container
+      if (msg.type === 'start_instance' && msg.instanceId) {
+        const id = msg.instanceId;
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) return;
+        console.log(`[bridge] Starting instance: ${id}`);
+        const { execFile } = require('child_process');
+        execFile('docker', ['start', id], { timeout: 15000 }, (err) => {
+          if (err) console.warn(`[bridge] Failed to start ${id}: ${err.message}`);
+          else console.log(`[bridge] Started instance: ${id}`);
+        });
+        return;
+      }
+      // Handle stop_instance — router tells us to stop a workspace container
+      if (msg.type === 'stop_instance' && msg.instanceId) {
+        const id = msg.instanceId;
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) return;
+        console.log(`[bridge] Stopping instance: ${id}`);
+        const { execFile } = require('child_process');
+        execFile('docker', ['stop', id], { timeout: 15000 }, (err) => {
+          if (err) console.warn(`[bridge] Failed to stop ${id}: ${err.message}`);
+          else console.log(`[bridge] Stopped instance: ${id}`);
+        });
+        return;
+      }
       // Handle remove_instance — router tells us to stop and remove a workspace container
       if (msg.type === 'remove_instance' && msg.instanceId) {
         const id = msg.instanceId;
