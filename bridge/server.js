@@ -178,9 +178,16 @@ async function recreateWithPorts() {
     portBindings[key] = [{ HostPort: String(p.host) }];
   }
 
+  // Build env: copy original env but inject resolved credentials.
+  // Remove PAIRING_CODE (one-time use) and add BRIDGE_ID + BRIDGE_TOKEN (permanent).
+  const env = (inspect.Config.Env || [])
+    .filter(e => !e.startsWith('PAIRING_CODE=') && !e.startsWith('BRIDGE_ID=') && !e.startsWith('BRIDGE_TOKEN='));
+  if (INSTANCE_ID) env.push(`BRIDGE_ID=${INSTANCE_ID}`);
+  if (BRIDGE_TOKEN) env.push(`BRIDGE_TOKEN=${BRIDGE_TOKEN}`);
+
   const createBody = {
     Image: inspect.Config.Image,
-    Env: inspect.Config.Env,
+    Env: env,
     ExposedPorts: { ...inspect.Config.ExposedPorts, ...exposedPorts },
     HostConfig: {
       ...inspect.HostConfig,
