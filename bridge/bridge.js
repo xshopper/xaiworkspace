@@ -177,15 +177,18 @@ function connectRouter() {
       if (msg.type === 'stop_orphan' && msg.instanceId) {
         const orphanId = msg.instanceId;
         if (!/^[a-zA-Z0-9_-]+$/.test(orphanId)) return;
-        console.log(`[bridge] Stopping orphaned instance: ${orphanId}`);
-        try {
-          const { execFileSync } = require('child_process');
-          execFileSync('docker', ['stop', '-t', '5', orphanId], { timeout: 15000, stdio: 'pipe' });
-          execFileSync('docker', ['rm', orphanId], { timeout: 10000, stdio: 'pipe' });
-          console.log(`[bridge] Removed orphaned instance: ${orphanId}`);
-        } catch (err) {
-          console.warn(`[bridge] Failed to stop orphan ${orphanId}: ${err.message}`);
-        }
+        // Only act if container exists locally
+        const { execFile } = require('child_process');
+        execFile('docker', ['inspect', '--format', '{{.State.Running}}', orphanId], { timeout: 5000 }, (err, stdout) => {
+          if (err) return; // container doesn't exist locally — ignore
+          console.log(`[bridge] Stopping orphaned instance: ${orphanId}`);
+          execFile('docker', ['stop', '-t', '5', orphanId], { timeout: 15000 }, () => {
+            execFile('docker', ['rm', orphanId], { timeout: 10000 }, (rmErr) => {
+              if (rmErr) console.warn(`[bridge] Failed to remove orphan ${orphanId}: ${rmErr.message}`);
+              else console.log(`[bridge] Removed orphaned instance: ${orphanId}`);
+            });
+          });
+        });
         return;
       }
       // Handle update command — trigger immediate update check via PM2
