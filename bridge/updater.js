@@ -294,8 +294,8 @@ async function checkForUpdate() {
   }
 
   console.log(`[updater] New image detected!`);
-  console.log(`[updater]   Old: ${beforeDigest}`);
-  console.log(`[updater]   New: ${afterDigest}`);
+  console.log(`[updater]   Old: ${runningImageId}`);
+  console.log(`[updater]   New: ${pulledImageId}`);
   sendUpdateProgress('detected', 'New bridge version detected');
 
   const config = getContainerConfig(containerId);
