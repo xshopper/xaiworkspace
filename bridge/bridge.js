@@ -149,6 +149,7 @@ function connectRouter() {
       }
       // Handle bridge_adopt — router found an existing bridge on same host
       if (msg.type === 'bridge_adopt') {
+        shuttingDown = true; // prevent reconnect after WS closes
         console.log('');
         console.log('══════════════════════════════════════');
         console.log('  Existing bridge found!');
@@ -159,8 +160,12 @@ function connectRouter() {
         console.log('  You are now connected.');
         console.log('══════════════════════════════════════');
         console.log('');
-        // Exit — container started with --rm will clean up
-        setTimeout(() => process.exit(0), 1000);
+        // Kill the entire PM2 runtime so the container exits (--rm cleans up).
+        // process.exit(0) only kills bridge.js — PM2 would restart it.
+        const { execFile } = require('child_process');
+        setTimeout(() => {
+          execFile('pm2', ['kill'], { timeout: 10000 }, () => process.exit(0));
+        }, 1000);
         return;
       }
       // Handle bridge_primary — no existing bridge, become the primary
