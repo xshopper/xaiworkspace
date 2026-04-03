@@ -178,6 +178,18 @@ function connectRouter() {
         } catch { /* best effort */ }
         return;
       }
+      // Handle remove_instance — router tells us to stop and remove a workspace container
+      if (msg.type === 'remove_instance' && msg.instanceId) {
+        const id = msg.instanceId;
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) return;
+        console.log(`[bridge] Removing instance: ${id}`);
+        const { execFile } = require('child_process');
+        execFile('docker', ['rm', '-f', id], { timeout: 15000 }, (err) => {
+          if (err) console.warn(`[bridge] Failed to remove ${id}: ${err.message}`);
+          else console.log(`[bridge] Removed instance: ${id}`);
+        });
+        return;
+      }
       // Handle stop_orphan — router tells us to stop an orphaned workspace container
       if (msg.type === 'stop_orphan' && msg.instanceId) {
         const orphanId = msg.instanceId;
