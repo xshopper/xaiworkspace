@@ -3,7 +3,7 @@
  * Bridge pairing server — serves health check and pairing redirect on port 3100.
  *
  * On startup:
- * 1. Calls POST /api/instances/register-pending on the router to get a pairing code
+ * 1. Resolves credentials via POST /api/bridges/claim-device
  * 2. Serves http://localhost:3100 → redirect to https://app.xaiworkspace.com/link?code=XXXX
  * 3. Serves http://localhost:3100/health → 200 OK
  * 4. Prints the pairing code + URL to stdout (for headless servers)
