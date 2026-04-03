@@ -88,6 +88,10 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Add Intel macOS target
+        if: matrix.target == 'macos'
+        run: rustup target add x86_64-apple-darwin
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -130,6 +134,7 @@ jobs:
           releaseBody: 'Desktop app for xAI Workspace — installs Docker, runs bridge, handles OAuth.'
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.target == 'macos' && '--target universal-apple-darwin' || '' }}
 
   # Summary job to check all platforms succeeded
   release-check:
