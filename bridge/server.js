@@ -160,25 +160,18 @@ async function recreateWithPorts() {
     Healthcheck: inspect.Config.Healthcheck,
   };
 
-  const originalName = inspect.Name.replace(/^\//, '');
-  const tempName = `${originalName}-replacing`;
+  // The initial container was started with --rm (no host port bindings).
+  // We can create the new container first (no port conflict), then start it,
+  // then stop self. Stopping a --rm container removes it immediately, so we
+  // must NOT stop self before creating the replacement.
+  const newName = `${INSTANCE_ID || 'xaiw-bridge'}-ported`;
 
-  // Clean up stale temp container from a previous crashed attempt
-  await dockerApiDelete(`/containers/${encodeURIComponent(tempName)}?force=true`);
+  // Clean up stale container from a previous attempt
+  await dockerApiDelete(`/containers/${encodeURIComponent(newName)}?force=true`);
 
-  // Rename self to temp name, then stop to release ports
-  const renameResp = await dockerApiPost(`/containers/${inspect.Id}/rename?name=${encodeURIComponent(tempName)}`);
-  if (renameResp.status !== 204 && renameResp.status !== 200) {
-    console.error(`[bridge] Failed to rename self: ${renameResp.status} ${renameResp.body?.message || ''}`);
-    return false;
-  }
-
-  // Stop old container to release host ports before creating the new one
-  await dockerApiPost(`/containers/${inspect.Id}/stop`);
-
-  // Create new container with original name and port bindings
+  // Create new container with port bindings
   const createResp = await dockerApiPost(
-    `/containers/create?name=${encodeURIComponent(originalName)}`,
+    `/containers/create?name=${encodeURIComponent(newName)}`,
     createBody,
   );
 
@@ -189,9 +182,6 @@ async function recreateWithPorts() {
     } else {
       console.error(`[bridge] Failed to create ported container: ${createResp.status} ${errMsg}`);
     }
-    // Rollback: restart and rename back
-    await dockerApiPost(`/containers/${inspect.Id}/start`);
-    await dockerApiPost(`/containers/${inspect.Id}/rename?name=${encodeURIComponent(originalName)}`);
     return false;
   }
 
@@ -207,9 +197,10 @@ async function recreateWithPorts() {
   console.log('══════════════════════════════════════');
   console.log('');
 
-  // Delete old (stopped) container
-  await dockerApiDelete(`/containers/${inspect.Id}?force=true`);
-  process.exit(0);
+  // Exit — the --rm flag on our container handles self-cleanup.
+  // Use pm2 kill to stop all processes and let the container exit.
+  const { execFile } = require('child_process');
+  execFile('pm2', ['kill'], { timeout: 10000 }, () => process.exit(0));
 }
 
 // Allowed CORS origins — restrict to known app URLs and localhost for dev
