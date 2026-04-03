@@ -132,7 +132,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'xAI Workspace Desktop ${{ github.ref_name }}'
           releaseBody: 'Desktop app for xAI Workspace — installs Docker, runs bridge, handles OAuth.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.target == 'macos' && '--target universal-apple-darwin' || '' }}
 
