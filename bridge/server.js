@@ -47,6 +47,36 @@ let BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
 // PAIRING_CODE: short-lived code to claim credentials from the router (replaces BRIDGE_TOKEN in docker command).
 const PAIRING_CODE = process.env.PAIRING_CODE || '';
 const BRIDGE_VERSION = require('./package.json').version;
+let HOST_OS = 'linux'; // resolved at startup via detectHostOs()
+
+/** Detect host OS via Docker API (container always reports linux). */
+async function detectHostOs() {
+  try {
+    const resp = await new Promise((resolve) => {
+      const req = http.request({ socketPath: '/var/run/docker.sock', path: '/info', method: 'GET' }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(3000, () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    if (!resp?.OSType) return 'linux';
+    // Docker Desktop on Mac/Windows reports OSType=linux but has "Docker Desktop" in Name
+    const name = (resp.Name || '').toLowerCase();
+    const os = resp.OperatingSystem || '';
+    if (os.includes('Docker Desktop') || name.includes('docker-desktop')) {
+      // Check kernel version for hints
+      const kernel = resp.KernelVersion || '';
+      if (kernel.includes('linuxkit') || kernel.includes('WSL')) {
+        // linuxkit = macOS Docker Desktop, WSL = Windows Docker Desktop
+        return kernel.includes('WSL') ? 'windows' : 'mac';
+      }
+    }
+    return resp.OSType === 'windows' ? 'windows' : 'linux';
+  } catch { return 'linux'; }
+}
 const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
@@ -280,7 +310,7 @@ async function setupPreProvisioned() {
         region: process.env.REGION || 'local',
         provider: process.env.PROVIDER || 'local',
         version: require('./package.json').version,
-        osType: process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux',
+        osType: HOST_OS,
       }),
     });
 
@@ -326,7 +356,7 @@ async function registerBridge() {
         region: process.env.REGION || 'local',
         provider: process.env.PROVIDER || 'local',
         version: require('./package.json').version,
-        osType: process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux',
+        osType: HOST_OS,
       }),
     });
 
@@ -610,12 +640,13 @@ async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
 }
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`[pairing] Bridge v${BRIDGE_VERSION} listening on port ${PORT}`);
+  HOST_OS = await detectHostOs();
+  console.log(`[pairing] Bridge v${BRIDGE_VERSION} listening on port ${PORT} (host: ${HOST_OS})`);
 
   // ── Pairing code resolution ──────────────────────────────────────────
   // If started with PAIRING_CODE (from docker command), resolve credentials from router.
   if (PAIRING_CODE && !BRIDGE_TOKEN) {
-    const osType = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux';
+    const osType = HOST_OS;
     let resolved = false;
     for (let attempt = 1; attempt <= 10 && !resolved; attempt++) {
       console.log(`[pairing] Resolving credentials from pairing code ${PAIRING_CODE}... (attempt ${attempt})`);
