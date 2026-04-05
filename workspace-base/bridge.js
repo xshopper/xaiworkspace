@@ -188,6 +188,7 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'install_app': handleInstallApp(msg); break;
     case 'uninstall_app': handleUninstallApp(msg); break;
+    case 'uninstall_app_instance': handleUninstallAppInstance(msg); break;
     case 'restart_app': handleRestartApp(msg); break;
     case 'list_apps': handleListApps(msg); break;
     case 'exec': handleExec(msg); break;
@@ -200,8 +201,8 @@ function send(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function sendProgress(id, slug, stage, percent) {
-  send({ type: 'install_progress', id, slug, stage, percent });
+function sendProgress(id, slug, stage, percent, name = null) {
+  send({ type: 'install_progress', id, slug, name: name || 'default', stage, percent });
 }
 
 // ── URL validation for app installs ─────────────────────────────────────────
@@ -450,7 +451,14 @@ async function handleSelfUpdate(msg) {
 // ── install_app ─────────────────────────────────────────────────────────────
 const _installingApps = new Set();
 async function handleInstallApp(msg) {
-  const { id, slug, identifier, artifactUrl, sourceUrl, subdir, env, manifest } = msg;
+  const { id, slug, identifier, artifactUrl, sourceUrl, subdir, env, manifest, name: instanceName, parameters, upgrade } = msg;
+  const instName = instanceName || 'default';
+
+  // Validate instance name (defense-in-depth — router also validates)
+  if (instName !== 'default' && !/^[a-z0-9][a-z0-9-]*$/.test(instName)) {
+    send({ type: 'install_result', id, slug, name: instName, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
 
   // Self-update: router sends slug 'bootstrap' to upgrade the workspace agent
   if (slug === 'bootstrap') {
@@ -546,7 +554,7 @@ async function handleInstallApp(msg) {
   try {
     // 1. Write env vars to secrets.env
     if (env && typeof env === 'object') {
-      sendProgress(id, slug, 'configuring', 5);
+      sendProgress(id, slug, 'configuring', 5, instName);
       const secretsPath = SECRETS_FILE;
       let existing = '';
       try { existing = fs.readFileSync(secretsPath, 'utf8'); } catch {}
@@ -567,7 +575,7 @@ async function handleInstallApp(msg) {
     }
 
     // 2. Download artifact
-    sendProgress(id, slug, 'downloading', 10);
+    sendProgress(id, slug, 'downloading', 10, instName);
     fs.mkdirSync(appDir, { recursive: true });
 
     // Record which env keys this app added so uninstall can clean them up.
@@ -592,7 +600,7 @@ async function handleInstallApp(msg) {
         console.log(`[workspace-agent] Artifact integrity verified: ${hash.slice(0, 8)}...`);
       }
 
-      sendProgress(id, slug, 'extracting', 30);
+      sendProgress(id, slug, 'extracting', 30, instName);
       const tmpDir = `/tmp/app-${slug}-${id.slice(0,8)}-extract`;
       await execAsync(`rm -rf "${tmpDir}" && mkdir -p "${tmpDir}" && unzip -qo "${tmpFile}" -d "${tmpDir}"`, { timeout: 30000 });
 
@@ -639,7 +647,7 @@ async function handleInstallApp(msg) {
     }
 
     // 3. Run install.sh if present (as derived user)
-    sendProgress(id, slug, 'installing', 50);
+    sendProgress(id, slug, 'installing', 50, instName);
     const installScript = path.join(appDir, 'scripts', 'install.sh');
     if (fs.existsSync(installScript)) {
       await execAsync(`su - ${WS_USER} -c 'cd "${appDir}" && APP_DIR="${appDir}" HOME="${HOME}" bash "${installScript}"'`, {
@@ -666,7 +674,7 @@ async function handleInstallApp(msg) {
     }
 
     // 5. Regenerate ecosystem and restart pm2 (generate-ecosystem.sh as derived user)
-    sendProgress(id, slug, 'starting', 80);
+    sendProgress(id, slug, 'starting', 80, instName);
     const genScript = path.join(appDir, 'scripts', 'generate-ecosystem.sh');
     if (fs.existsSync(genScript)) {
       await execAsync(`su - ${WS_USER} -c 'cd "${appDir}" && APP_DIR="${appDir}" HOME="${HOME}" bash "${genScript}"'`, {
@@ -674,21 +682,55 @@ async function handleInstallApp(msg) {
       });
     }
 
-    const ecoFile = path.join(appDir, 'ecosystem.config.js');
-    if (fs.existsSync(ecoFile)) {
-      await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
-    } else if (manifest?.startup) {
-      // No ecosystem file — generate one from manifest startup command
-      const startupCmd = manifest.startup;
-      const eco = 'module.exports = { apps: [{ name: ' + JSON.stringify(slug) + ', script: "/bin/bash", args: ["-c", ' + JSON.stringify(startupCmd) + '], cwd: ' + JSON.stringify(appDir) + ', autorestart: true }] };';
-      fs.writeFileSync(ecoFile, eco);
-      await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
-      console.log('[bootstrap] Generated ecosystem from manifest.startup for ' + slug);
-    }
+    // Determine pm2 process name: slug for default, slug--name for named instances
+    const processName = instName === 'default' ? slug : `${slug}--${instName}`;
 
-    sendProgress(id, slug, 'complete', 100);
-    send({ type: 'install_result', id, slug, status: 'ok' });
-    console.log(`[workspace-agent] App installed: ${slug}`);
+    // Upgrade mode: re-download code (done above), then restart ALL instances of this app
+    if (upgrade) {
+      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      if (fs.existsSync(ecoFile)) {
+        await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
+      }
+      // Restart any named instances (slug--*)
+      try {
+        const pm2List = JSON.parse(await execAsync('pm2 jlist', { timeout: 10000 }).then(r => r.stdout || '[]'));
+        for (const p of pm2List) {
+          if (p.name !== slug && p.name.startsWith(`${slug}--`)) {
+            await execAsync(`pm2 restart "${p.name}"`, { timeout: 10000 }).catch(() => {});
+          }
+        }
+      } catch {}
+      sendProgress(id, slug, 'complete', 100, instName);
+      send({ type: 'install_result', id, slug, name: instName, status: 'ok' });
+      console.log(`[workspace-agent] App upgraded: ${slug} (all instances restarted)`);
+    } else {
+      // Normal install — start the pm2 process with instance env vars
+      const instanceEnv = {
+        APP_INSTANCE_NAME: instName,
+        APP_PARAMETERS: JSON.stringify(parameters || {}),
+      };
+
+      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      if (instName === 'default' && fs.existsSync(ecoFile)) {
+        // Default instance with existing ecosystem file — use it as-is
+        await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
+      } else if (manifest?.startup) {
+        // Generate instance-specific ecosystem config
+        const startupCmd = manifest.startup;
+        const instanceEcoFile = instName === 'default' ? ecoFile : path.join(appDir, `ecosystem.${instName}.config.js`);
+        const eco = 'module.exports = { apps: [{ name: ' + JSON.stringify(processName) + ', script: "/bin/bash", args: ["-c", ' + JSON.stringify(startupCmd) + '], cwd: ' + JSON.stringify(appDir) + ', autorestart: true, env: ' + JSON.stringify(instanceEnv) + ' }] };';
+        fs.writeFileSync(instanceEcoFile, eco);
+        await execAsync(`pm2 startOrRestart "${instanceEcoFile}" --update-env`, { timeout: 30000 });
+        console.log(`[workspace-agent] Started ${processName} from manifest.startup`);
+      } else if (fs.existsSync(ecoFile)) {
+        // No startup in manifest but ecosystem exists — use default ecosystem
+        await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
+      }
+
+      sendProgress(id, slug, 'complete', 100, instName);
+      send({ type: 'install_result', id, slug, name: instName, status: 'ok' });
+      console.log(`[workspace-agent] App installed: ${slug}/${instName} (process: ${processName})`);
+    }
     // Installation succeeded — clean up backup
     if (appBackedUp) fs.rmSync(appBackupPath, { recursive: true, force: true });
   } catch (err) {
@@ -711,7 +753,7 @@ async function handleInstallApp(msg) {
       // Fresh install with no backup — clean up partially-written app dir
       try { fs.rmSync(appDir, { recursive: true, force: true }); } catch {}
     }
-    send({ type: 'install_result', id, slug, status: 'error', error: err.message });
+    send({ type: 'install_result', id, slug, name: instName, status: 'error', error: err.message });
   } finally {
     _installingApps.delete(slug);
   }
@@ -783,6 +825,40 @@ function handleUninstallApp(msg) {
   } catch (err) {
     send({ type: 'uninstall_result', id, slug, status: 'error', error: err.message });
   }
+}
+
+// ── uninstall_app_instance — stop a named pm2 process (app files stay) ─────
+function handleUninstallAppInstance(msg) {
+  const { slug, name } = msg;
+  // Always derive process name from validated slug + name (never trust msg.processName)
+  const procName = (!name || name === 'default') ? slug : `${slug}--${name}`;
+
+  // Validate before use in pm2 command
+  if (!SAFE_SLUG.test(slug)) {
+    send({ type: 'uninstall_result', slug, name, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+  if (name && !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    send({ type: 'uninstall_result', slug, name, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
+
+  try {
+    execFileSync('pm2', ['stop', procName], { timeout: 10000 });
+    execFileSync('pm2', ['delete', procName], { timeout: 10000 });
+  } catch {}
+
+  // Remove instance-specific ecosystem file if it exists
+  try {
+    const identifier = `com.xshopper.${slug}`;
+    const ecoFile = path.join(APPS_DIR, identifier, `ecosystem.${name}.config.js`);
+    if (name && name !== 'default' && fs.existsSync(ecoFile)) {
+      fs.unlinkSync(ecoFile);
+    }
+  } catch {}
+
+  send({ type: 'uninstall_result', slug, name: name || 'default', status: 'ok' });
+  console.log(`[workspace-agent] Instance stopped: ${procName}`);
 }
 
 // ── restart_app ─────────────────────────────────────────────────────────────
