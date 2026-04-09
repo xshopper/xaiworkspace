@@ -58,4 +58,5 @@ export WS_USER
 rm -rf /tmp/bootstrap-update-* /tmp/bootstrap-backup-* /tmp/app-*-backup-* 2>/dev/null || true
 
 echo "[entrypoint] Secrets written, user=$WS_USER home=$WS_HOME, starting workspace agent..."
+export PM2_HOME="$WS_HOME/.pm2"
 exec pm2-runtime start /opt/bootstrap/ecosystem.config.js --raw

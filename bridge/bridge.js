@@ -232,6 +232,30 @@ function connectRouter() {
         });
         return;
       }
+      // Handle pm2_list — return this bridge's own pm2 process list
+      if (msg.type === 'pm2_list') {
+        const { execFile } = require('child_process');
+        execFile('pm2', ['jlist', '--no-color'], { timeout: 8000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+          const processes = [];
+          if (!err && stdout) {
+            try {
+              for (const p of JSON.parse(stdout.trim())) {
+                processes.push({
+                  name: p.name,
+                  status: p.pm2_env?.status || 'unknown',
+                  restarts: p.pm2_env?.restart_time || 0,
+                  cpu: p.monit?.cpu || 0,
+                  memory: p.monit?.memory || 0,
+                });
+              }
+            } catch {}
+          }
+          if (routerWs?.readyState === WebSocket.OPEN) {
+            routerWs.send(JSON.stringify({ type: 'pm2_list_result', processes }));
+          }
+        });
+        return;
+      }
       // Handle update command — trigger immediate update check via PM2
       if (msg.type === 'check_update') {
         console.log('[bridge] Router requested update check');

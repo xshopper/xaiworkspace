@@ -47,6 +47,9 @@ const WS_HOME = `/home/${WS_USER}`;
 const HOME = process.env.HOME || WS_HOME;
 const APPS_DIR = path.join(HOME, 'apps');
 
+// Ensure all pm2 CLI calls use the correct PM2 daemon (started by pm2-runtime under WS_HOME)
+process.env.PM2_HOME = process.env.PM2_HOME || `${WS_HOME}/.pm2`;
+
 // ── Agent version (reported to router; router can trigger self-update) ─────
 const AGENT_VERSION = '1.1.0';
 
