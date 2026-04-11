@@ -1,18 +1,22 @@
 #!/usr/bin/env node
 /**
- * Bridge pairing server — serves health check and pairing redirect on port 3100.
+ * Bridge pairing server (multi-router) — serves health check, pairing redirect,
+ * and router management API on port 3100.
  *
  * On startup:
- * 1. Resolves credentials via POST /api/bridges/claim-device
- * 2. Serves http://localhost:3100 → redirect to https://app.xaiworkspace.com/link?code=XXXX
- * 3. Serves http://localhost:3100/health → 200 OK
- * 4. Prints the pairing code + URL to stdout (for headless servers)
+ * 1. Registers with each router in ROUTER_URLS via POST /api/bridges/register
+ * 2. Writes credentials to /data/routers.json
+ * 3. Serves http://localhost:3100 → router management page
+ * 4. Serves http://localhost:3100/health → 200 OK
+ * 5. Prints pairing codes to stdout
  */
 const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const compose = require('./compose-manager');
+
+const ROUTERS_FILE = '/data/routers.json';
 
 /** Timing-safe secret comparison to prevent timing side-channel attacks. */
 function safeCompare(a, b) {
@@ -23,14 +27,15 @@ function safeCompare(a, b) {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-const ROUTER_URL = process.env.ROUTER_URL;
-if (!ROUTER_URL) {
-  console.error('[config] FATAL: ROUTER_URL env var is required (prevents silent fallback to production)');
+// ROUTER_URLS: comma-separated list of router base URLs
+const ROUTER_URLS_RAW = process.env.ROUTER_URLS || process.env.ROUTER_URL || '';
+const INITIAL_ROUTER_URLS = ROUTER_URLS_RAW.split(',').map(u => u.trim()).filter(Boolean);
+if (INITIAL_ROUTER_URLS.length === 0) {
+  console.error('[config] FATAL: ROUTER_URLS env var is required');
   process.exit(1);
 }
+
 // Read router secret from env var first, then fall back to Docker secret file.
-// The Tauri app mounts the secret as a read-only file to avoid exposing it
-// in `docker inspect` output (which shows all -e env vars in cleartext).
 const SECRETS_FILE_PATH = '/run/secrets/router_secret';
 const ROUTER_SECRET = process.env.ROUTER_SECRET
   || (() => {
@@ -40,14 +45,25 @@ const ROUTER_SECRET = process.env.ROUTER_SECRET
 if (!ROUTER_SECRET) {
   console.warn('[config] WARNING: ROUTER_SECRET not set (checked env var and /run/secrets/router_secret)');
 }
-// BRIDGE_ID is the preferred name (from POST /api/bridges), INSTANCE_ID is the legacy fallback
-let INSTANCE_ID = process.env.BRIDGE_ID || process.env.INSTANCE_ID || '';
-// BRIDGE_TOKEN: permanent credential for WS auth (resolved from pairing code or set directly).
-let BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
-// PAIRING_CODE: short-lived code to claim credentials from the router (replaces BRIDGE_TOKEN in docker command).
-const PAIRING_CODE = process.env.PAIRING_CODE || '';
+
 const BRIDGE_VERSION = require('./package.json').version;
 let HOST_OS = 'linux'; // resolved at startup via detectHostOs()
+const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
+const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
+const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10);
+
+// Domain allowlist for adding new routers
+const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
+
+/** Validate a router URL against the domain allowlist. */
+function isAllowedRouterUrl(routerUrl) {
+  try {
+    const { hostname } = new URL(routerUrl);
+    return ALLOWED_ROUTER_DOMAINS.some(d =>
+      d.startsWith('.') ? hostname.endsWith(d) || hostname === d.slice(1) : hostname === d
+    );
+  } catch { return false; }
+}
 
 /** Detect host OS via Docker API (container always reports linux). */
 async function detectHostOs() {
@@ -63,31 +79,41 @@ async function detectHostOs() {
       req.end();
     });
     if (!resp?.OSType) return 'linux';
-    // Docker Desktop on Mac/Windows reports OSType=linux but has "Docker Desktop" in Name
-    const name = (resp.Name || '').toLowerCase();
     const os = resp.OperatingSystem || '';
-    if (os.includes('Docker Desktop') || name.includes('docker-desktop')) {
-      // Check kernel version for hints
+    if (os.includes('Docker Desktop')) {
       const kernel = resp.KernelVersion || '';
-      if (kernel.includes('linuxkit') || kernel.includes('WSL')) {
-        // linuxkit = macOS Docker Desktop, WSL = Windows Docker Desktop
-        return kernel.includes('WSL') ? 'windows' : 'mac';
-      }
+      if (kernel.includes('WSL')) return 'windows';
+      if (kernel.includes('linuxkit')) return 'mac';
     }
     return resp.OSType === 'windows' ? 'windows' : 'linux';
   } catch { return 'linux'; }
 }
-const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
-const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
-const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10); // 30s
 
-// ── Docker API helpers (via unix socket) ──────────────────────────────────
-// Used for port re-creation when router instructs this bridge to become primary.
+// ── Routers file management ──────────────────────────────────────────────
+
+function loadRouters() {
+  try { return JSON.parse(fs.readFileSync(ROUTERS_FILE, 'utf8')); }
+  catch { return []; }
+}
+
+function saveRouters(routers) {
+  const tmp = ROUTERS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(routers, null, 2));
+  fs.renameSync(tmp, ROUTERS_FILE);
+}
+
+/** Check if any known bridge token matches. */
+function hasValidBridgeToken(headerToken) {
+  if (!headerToken) return false;
+  const routers = loadRouters();
+  return routers.some(r => safeCompare(headerToken, r.bridgeToken));
+}
+
+// ── Docker API helpers ───────────────────────────────────────────────────
 
 function dockerApiGet(path) {
   return new Promise((resolve) => {
-    const options = { socketPath: '/var/run/docker.sock', path, method: 'GET' };
-    const req = http.request(options, (res) => {
+    const req = http.request({ socketPath: '/var/run/docker.sock', path, method: 'GET' }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -139,13 +165,12 @@ function dockerApiDelete(path) {
 
 // Ports required for OAuth callbacks and pairing redirect
 const BRIDGE_PORTS = [
-  { container: 3100, host: 3100 },   // pairing server
-  { container: 54545, host: 54545 }, // Claude OAuth
-  { container: 8085, host: 8085 },   // Gemini OAuth
-  { container: 1455, host: 1455 },   // Codex OAuth
+  { container: 3100, host: 3100 },
+  { container: 54545, host: 54545 },
+  { container: 8085, host: 8085 },
+  { container: 1455, host: 1455 },
 ];
 
-/** Check if this container was started without host port bindings. */
 async function needsPortBindings() {
   const hostname = require('os').hostname();
   const inspect = await dockerApiGet(`/containers/${hostname}/json`);
@@ -157,8 +182,7 @@ async function needsPortBindings() {
 
 /**
  * Re-create this container with host port bindings.
- * Called when router sends bridge_primary and container has no ports.
- * Returns false on failure; on success the process is killed (never returns).
+ * Uses credentials from the first router for the container env.
  */
 async function recreateWithPorts() {
   const hostname = require('os').hostname();
@@ -178,12 +202,18 @@ async function recreateWithPorts() {
     portBindings[key] = [{ HostPort: String(p.host) }];
   }
 
-  // Build env: copy original env but inject resolved credentials.
-  // Remove PAIRING_CODE (one-time use) and add BRIDGE_ID + BRIDGE_TOKEN (permanent).
+  // Build env: copy original env but replace router config.
+  // Remove old single-router vars, add ROUTER_URLS.
+  const routers = loadRouters();
+  const routerUrls = routers.map(r => r.routerUrl).join(',');
   const env = (inspect.Config.Env || [])
-    .filter(e => !e.startsWith('PAIRING_CODE=') && !e.startsWith('BRIDGE_ID=') && !e.startsWith('BRIDGE_TOKEN='));
-  if (INSTANCE_ID) env.push(`BRIDGE_ID=${INSTANCE_ID}`);
-  if (BRIDGE_TOKEN) env.push(`BRIDGE_TOKEN=${BRIDGE_TOKEN}`);
+    .filter(e => !e.startsWith('PAIRING_CODE=') && !e.startsWith('BRIDGE_ID=')
+      && !e.startsWith('BRIDGE_TOKEN=') && !e.startsWith('ROUTER_URL=')
+      && !e.startsWith('ROUTER_URLS='));
+  env.push(`ROUTER_URLS=${routerUrls}`);
+
+  // Use first router's bridge ID for the container name
+  const bridgeId = routers[0]?.bridgeId || `xaiw-bridge-${crypto.randomBytes(4).toString('hex')}`;
 
   const createBody = {
     Image: inspect.Config.Image,
@@ -199,16 +229,9 @@ async function recreateWithPorts() {
     Healthcheck: inspect.Config.Healthcheck,
   };
 
-  // The initial container was started with --rm (no host port bindings).
-  // We can create the new container first (no port conflict), then start it,
-  // then stop self. Stopping a --rm container removes it immediately, so we
-  // must NOT stop self before creating the replacement.
-  const newName = `${INSTANCE_ID || 'xaiw-bridge'}-ported`;
-
-  // Clean up stale container from a previous attempt
+  const newName = `${bridgeId}-ported`;
   await dockerApiDelete(`/containers/${encodeURIComponent(newName)}?force=true`);
 
-  // Create new container with port bindings
   const createResp = await dockerApiPost(
     `/containers/create?name=${encodeURIComponent(newName)}`,
     createBody,
@@ -232,125 +255,22 @@ async function recreateWithPorts() {
   console.log('  New bridge created!');
   console.log(`  Ports: ${BRIDGE_PORTS.map(p => p.host).join(', ')}`);
   console.log(`  Container: ${newId.slice(0, 12)}`);
+  console.log(`  Routers: ${routers.length}`);
   console.log('  Bridge is running in the background.');
   console.log('══════════════════════════════════════');
   console.log('');
 
-  // Exit — the --rm flag on our container handles self-cleanup.
-  // Use pm2 kill to stop all processes and let the container exit.
-  const { execFile } = require('child_process');
   execFile('pm2', ['kill'], { timeout: 10000 }, () => process.exit(0));
 }
 
-// Allowed CORS origins — restrict to known app URLs and localhost for dev
-const ALLOWED_ORIGINS = new Set([
-  APP_URL,
-  ROUTER_URL,
-  'http://localhost:4200',
-  'http://localhost:3000',
-  'https://xaiworkspace.com',
-  'https://app-test.xaiworkspace.com',
-]);
-
-/** Fetch non-sensitive config from router (app URL, etc). Never fetch secrets over unauthenticated endpoints. */
-async function fetchRouterConfig() {
-  try {
-    const url = new URL('/api/config/desktop', ROUTER_URL);
-    const resp = await fetch(url.toString(), { signal: AbortSignal.timeout(5000) });
-    if (!resp.ok) return;
-    const cfg = await resp.json();
-    // NOTE: routerSecret is intentionally NOT fetched here — it must be provided via
-    // ROUTER_SECRET env var or the authenticated /api/config/provision endpoint.
-    if (cfg.routerSecret) {
-      console.warn('[config] Desktop config endpoint is exposing routerSecret — this should be removed from the router API');
-    }
-  } catch (err) {
-    console.warn('[config] Failed to fetch router config:', err.message);
-  }
-}
-
-let pairingCode = null;
-let pairingUrl = null;
-let registered = false;
+// ── Router registration ──────────────────────────────────────────────────
 
 /**
- * Pre-provisioned flow: bridge was created via POST /api/bridges (user-authenticated).
- * BRIDGE_TOKEN is already set — write auth.json and mark as registered.
- * The pairing code was already assigned server-side; we fetch it via the connect endpoint.
+ * Register with a single router. Returns { routerUrl, bridgeId, bridgeToken, pairingCode } or null.
  */
-async function setupPreProvisioned() {
-  console.log(`[pairing] Pre-provisioned bridge: ${INSTANCE_ID}`);
-
-  // Write credentials for bridge.js WS auth
-  const authData = {
-    type: 'gateway_auth',
-    instanceId: INSTANCE_ID,
-    instanceToken: BRIDGE_TOKEN,
-  };
-  fs.writeFileSync('/data/auth.json', JSON.stringify(authData));
-
-  // Restart bridge process with updated credentials
-  const { execSync } = require('child_process');
+async function registerWithRouter(routerUrl) {
   try {
-    execSync(`pm2 restart bridge --update-env`, {
-      env: { ...process.env, AUTH_JSON: JSON.stringify(authData) },
-      timeout: 10_000,
-    });
-    console.log('[pairing] Bridge process restarted with credentials');
-  } catch (err) {
-    console.warn('[pairing] Failed to restart bridge process:', err.message);
-  }
-
-  // Register with the router to get pairing code and confirm connectivity.
-  // Uses BRIDGE_TOKEN as x-bridge-token for auth (not ROUTER_SECRET).
-  try {
-    const url = new URL('/api/bridges/register', ROUTER_URL);
-    const resp = await fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-bridge-token': BRIDGE_TOKEN,
-      },
-      body: JSON.stringify({
-        bridgeId: INSTANCE_ID,
-        port: PORT,
-        region: process.env.REGION || 'local',
-        provider: process.env.PROVIDER || 'local',
-        version: require('./package.json').version,
-        osType: HOST_OS,
-      }),
-    });
-
-    if (resp.ok) {
-      const data = await resp.json();
-      pairingCode = data.pairingCode;
-      pairingUrl = `${APP_URL}/link?code=${pairingCode}`;
-    }
-  } catch (err) {
-    console.warn('[pairing] Failed to fetch pairing code:', err.message);
-  }
-
-  registered = true;
-  console.log('');
-  console.log('══════════════════════════════════════');
-  console.log(`  xAI Workspace Bridge ready!`);
-  if (pairingCode) {
-    console.log('');
-    console.log(`  Link: ${pairingUrl}`);
-    console.log(`  Code: ${pairingCode}`);
-    console.log('  Share this code with users to create workspaces.');
-  }
-  console.log('══════════════════════════════════════');
-  console.log('');
-}
-
-/**
- * Self-registration flow: bridge registers with ROUTER_SECRET.
- * Used when bridge is started manually (not via POST /api/bridges).
- */
-async function registerBridge() {
-  try {
-    const url = new URL('/api/bridges/register', ROUTER_URL);
+    const url = new URL('/api/bridges/register', routerUrl);
     const resp = await fetch(url.toString(), {
       method: 'POST',
       headers: {
@@ -358,62 +278,90 @@ async function registerBridge() {
         'x-router-secret': ROUTER_SECRET,
       },
       body: JSON.stringify({
-        bridgeId: INSTANCE_ID,
         port: PORT,
         region: process.env.REGION || 'local',
         provider: process.env.PROVIDER || 'local',
-        version: require('./package.json').version,
+        version: BRIDGE_VERSION,
         osType: HOST_OS,
       }),
     });
 
     if (!resp.ok) {
       const err = await resp.text();
-      console.error(`[pairing] Bridge register failed: ${resp.status} ${err}`);
-      return;
+      console.error(`[pairing] Register failed for ${routerUrl}: ${resp.status} ${err}`);
+      return null;
     }
 
     const data = await resp.json();
-    pairingCode = data.pairingCode;
-    pairingUrl = `${APP_URL}/link?code=${pairingCode}`;
-    registered = true;
-
-    // Write bridge credentials so bridge.js can authenticate with the router WS.
-    if (data.bridgeToken) {
-      const authData = {
-        type: 'gateway_auth',
-        instanceId: INSTANCE_ID,
-        instanceToken: data.bridgeToken,
-      };
-      fs.writeFileSync('/data/auth.json', JSON.stringify(authData));
-      // Restart bridge process with updated credentials
-      const { execSync } = require('child_process');
-      try {
-        execSync(`pm2 restart bridge --update-env`, {
-          env: { ...process.env, AUTH_JSON: JSON.stringify(authData) },
-          timeout: 10_000,
-        });
-        console.log('[pairing] Bridge process restarted with credentials');
-      } catch (err) {
-        console.warn('[pairing] Failed to restart bridge process:', err.message);
-      }
-    }
-
-    console.log('');
-    console.log('══════════════════════════════════════');
-    console.log(`  xAI Workspace Bridge ready! (${data.isNew ? 'new' : 'reconnect'})`);
-    console.log('');
-    console.log(`  Link: ${pairingUrl}`);
-    console.log(`  Code: ${pairingCode}`);
-    console.log('  Share this code with users to create workspaces.');
-    console.log('══════════════════════════════════════');
-    console.log('');
+    return {
+      routerUrl,
+      bridgeId: data.bridgeId,
+      bridgeToken: data.bridgeToken,
+      pairingCode: data.pairingCode,
+    };
   } catch (err) {
-    console.error('[pairing] Failed to register:', err.message);
+    console.error(`[pairing] Failed to register with ${routerUrl}: ${err.message}`);
+    return null;
   }
 }
 
-/** Parse JSON body from request. */
+/**
+ * Register with all initial routers. Retries failed ones.
+ */
+async function registerAllRouters() {
+  const routers = loadRouters();
+  const existingUrls = new Set(routers.map(r => r.routerUrl));
+
+  const toRegister = INITIAL_ROUTER_URLS.filter(url => !existingUrls.has(url));
+  if (toRegister.length === 0 && routers.length > 0) {
+    console.log(`[pairing] All ${routers.length} router(s) already registered`);
+    printStatus(routers);
+    return;
+  }
+
+  console.log(`[pairing] Registering with ${toRegister.length} new router(s) concurrently...`);
+
+  async function registerWithRetries(routerUrl) {
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      const result = await registerWithRouter(routerUrl);
+      if (result) return result;
+      const delay = Math.min(5000 * attempt, 30000);
+      console.log(`[pairing] Retry ${attempt}/10 for ${routerUrl} in ${delay / 1000}s`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+    console.error(`[pairing] Failed to register with ${routerUrl} after 10 attempts`);
+    return null;
+  }
+
+  const results = await Promise.allSettled(toRegister.map(url => registerWithRetries(url)));
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) {
+      routers.push(r.value);
+      console.log(`[pairing] Registered with ${r.value.routerUrl}: bridge=${r.value.bridgeId}`);
+    }
+  }
+
+  saveRouters(routers);
+  printStatus(routers);
+}
+
+function printStatus(routers) {
+  console.log('');
+  console.log('══════════════════════════════════════');
+  console.log(`  xAI Workspace Bridge v${BRIDGE_VERSION}`);
+  console.log(`  Connected to ${routers.length} router(s):`);
+  for (const r of routers) {
+    console.log(`    ${r.routerUrl} (${r.bridgeId})`);
+    if (r.pairingCode) {
+      console.log(`      Code: ${r.pairingCode}`);
+    }
+  }
+  console.log('══════════════════════════════════════');
+  console.log('');
+}
+
+// ── Parse JSON body ──────────────────────────────────────────────────────
+
 function parseBody(req) {
   return new Promise((resolve) => {
     let data = '';
@@ -424,41 +372,190 @@ function parseBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  const origin = req.headers.origin || '';
-  const cors = () => {
-    if (ALLOWED_ORIGINS.has(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
+// ── Router management web UI HTML ────────────────────────────────────────
+
+/** Escape HTML to prevent XSS from router-supplied values. */
+function esc(str) {
+  return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function routerManagementPage() {
+  const routers = loadRouters();
+  const routerRows = routers.map(r => `
+    <tr>
+      <td>${esc(r.routerUrl)}</td>
+      <td><button data-url="${esc(r.routerUrl)}" class="btn-remove">Remove</button></td>
+    </tr>`).join('');
+
+  return `<!DOCTYPE html>
+<html><head><title>Bridge Router Management</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0f0f0f; color: #e5e5e5; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 24px; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }
+  th { color: #999; font-size: 12px; text-transform: uppercase; }
+  input { background: #1a1a1a; border: 1px solid #333; color: #e5e5e5; padding: 8px 12px; border-radius: 6px; width: 300px; }
+  button { background: #3b82f6; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #2563eb; }
+  button.danger { background: #dc3545; }
+  button.danger:hover { background: #b02a37; }
+  .status { padding: 8px; border-radius: 6px; margin-top: 8px; display: none; }
+  .status.error { background: #3b1a1a; color: #f87171; display: block; }
+  .status.ok { background: #1a3b1a; color: #4ade80; display: block; }
+</style></head>
+<body>
+  <h1>Bridge Router Management</h1>
+  <table>
+    <tr><th>Router URL</th><th></th></tr>
+    ${routerRows || '<tr><td colspan="2" style="color:#666">No routers connected</td></tr>'}
+  </table>
+  <h2 style="font-size:16px">Add Router</h2>
+  <form onsubmit="addRouter(event)">
+    <input id="url" placeholder="https://router.xaiworkspace.com" required>
+    <button type="submit">Add</button>
+  </form>
+  <div id="status" class="status"></div>
+  <script>
+    async function addRouter(e) {
+      e.preventDefault();
+      const url = document.getElementById('url').value.trim();
+      const s = document.getElementById('status');
+      s.className = 'status'; s.textContent = '';
+      try {
+        const r = await fetch('/api/routers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({routerUrl:url}) });
+        const d = await r.json();
+        if (r.ok) { s.className = 'status ok'; s.textContent = 'Added successfully'; setTimeout(() => location.reload(), 1000); }
+        else { s.className = 'status error'; s.textContent = d.error || 'Failed'; }
+      } catch(err) { s.className = 'status error'; s.textContent = err.message; }
     }
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-router-secret, x-bridge-token');
-  };
-  cors();
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.btn-remove');
+      if (!btn) return;
+      const url = btn.dataset.url;
+      if (!confirm('Remove ' + url + '?')) return;
+      await fetch('/api/routers', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({routerUrl:url}) });
+      location.reload();
+    });
+  </script>
+</body></html>`;
+}
+
+// ── HTTP Server ──────────────────────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-router-secret, x-bridge-token');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  // ── Health check ────────────────────────────────────────────────────
   if (req.url === '/health') {
+    const routers = loadRouters();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, registered, pairingCode: !!pairingCode }));
+    res.end(JSON.stringify({ ok: true, routers: routers.length }));
     return;
   }
 
-  if (req.url === '/pairing-code') {
-    // Accept x-router-secret OR x-bridge-token (Tauri reuse path uses bridge token)
-    const hasRouterSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
-    const hasBridgeToken = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
-    if (!hasRouterSecret && !hasBridgeToken) {
+  // ── Router management API ───────────────────────────────────────────
+
+  if (req.url === '/api/routers' && req.method === 'GET') {
+    const routers = loadRouters();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // Return non-sensitive fields only (no tokens, no pairing codes)
+    res.end(JSON.stringify(routers.map(r => ({
+      routerUrl: r.routerUrl,
+    }))));
+    return;
+  }
+
+  if (req.url === '/api/routers' && req.method === 'POST') {
+    // Auth: require ROUTER_SECRET or any valid bridge token
+    const hasSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasToken = hasValidBridgeToken(req.headers['x-bridge-token']);
+    // Also allow unauthenticated requests from the web UI (same-origin localhost)
+    const isLocalhost = /^(127\.|::1|::ffff:127\.)/.test(req.socket?.remoteAddress || '');
+    if (!hasSecret && !hasToken && !isLocalhost) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
+    const body = await parseBody(req);
+    const { routerUrl } = body;
+
+    if (!routerUrl || typeof routerUrl !== 'string') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'routerUrl required' }));
+      return;
+    }
+
+    if (!isAllowedRouterUrl(routerUrl)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Router URL not in allowed domains' }));
+      return;
+    }
+
+    const routers = loadRouters();
+    if (routers.some(r => r.routerUrl === routerUrl)) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Router already registered' }));
+      return;
+    }
+
+    const result = await registerWithRouter(routerUrl);
+    if (!result) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to register with router' }));
+      return;
+    }
+
+    routers.push(result);
+    saveRouters(routers);
+    console.log(`[api] Added router: ${routerUrl} (${result.bridgeId})`);
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ code: pairingCode, url: pairingUrl, registered }));
+    res.end(JSON.stringify({ ok: true, routerUrl, bridgeId: result.bridgeId }));
     return;
   }
 
-  // ── Compose stack management API ──────────────────────────────────────
+  if (req.url === '/api/routers' && req.method === 'DELETE') {
+    // Same auth as POST
+    const hasSecretDel = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasTokenDel = hasValidBridgeToken(req.headers['x-bridge-token']);
+    const isLocalhostDel = /^(127\.|::1|::ffff:127\.)/.test(req.socket?.remoteAddress || '');
+    if (!hasSecretDel && !hasTokenDel && !isLocalhostDel) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    const body = await parseBody(req);
+    const { routerUrl } = body;
+
+    if (!routerUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'routerUrl required' }));
+      return;
+    }
+
+    const routers = loadRouters();
+    const filtered = routers.filter(r => r.routerUrl !== routerUrl);
+    if (filtered.length === routers.length) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Router not found' }));
+      return;
+    }
+
+    saveRouters(filtered);
+    console.log(`[api] Removed router: ${routerUrl}`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // ── Compose stack management API ────────────────────────────────────
 
   if (req.url === '/api/instances' && req.method === 'GET') {
     const instances = compose.listInstances();
@@ -468,12 +565,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/api/instances' && req.method === 'POST') {
-    // Auth: router can provision instances using either ROUTER_SECRET or BRIDGE_TOKEN.
-    // The provisioner sends x-bridge-token (per-bridge secret from DB).
-    // Legacy / local deployments may send x-router-secret.
-    const hasRouterSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
-    const hasBridgeToken = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
-    if (!hasRouterSecret && !hasBridgeToken) {
+    const hasSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasToken = hasValidBridgeToken(req.headers['x-bridge-token']);
+    if (!hasSecret && !hasToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -500,16 +594,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url?.startsWith('/api/instances/') && req.url.endsWith('/health') && req.method === 'GET') {
+    const parts = req.url.split('/');
+    const instanceId = decodeURIComponent(parts[3]);
+    if (!/^[a-zA-Z0-9_-]+$/.test(instanceId)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid instanceId' }));
+      return;
+    }
+    const instances = compose.listInstances();
+    const inst = instances.find(i => i.name === instanceId);
+    res.writeHead(inst ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: !!inst, status: inst?.status }));
+    return;
+  }
+
   if (req.url?.startsWith('/api/instances/') && req.method === 'DELETE') {
-    const hasRouterSecretDel = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
-    const hasBridgeTokenDel = BRIDGE_TOKEN && safeCompare(req.headers['x-bridge-token'], BRIDGE_TOKEN);
-    if (!hasRouterSecretDel && !hasBridgeTokenDel) {
+    const hasSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
+    const hasToken = hasValidBridgeToken(req.headers['x-bridge-token']);
+    if (!hasSecret && !hasToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
     const instanceId = decodeURIComponent(req.url.split('/api/instances/')[1]);
-    if (instanceId === INSTANCE_ID || instanceId.startsWith('xaiw-bridge')) {
+    if (instanceId.startsWith('xaiw-bridge')) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Cannot remove the bridge' }));
       return;
@@ -525,66 +634,53 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Default: redirect to pairing URL, app URL (if claimed), or show waiting page
-  if (pairingUrl) {
-    res.writeHead(302, { Location: pairingUrl });
-    res.end();
-  } else if (registered) {
-    // Already claimed — redirect to the app directly
-    res.writeHead(302, { Location: APP_URL });
-    res.end();
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="3">
-      <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f0f0f;color:#e5e5e5}
-      .s{width:24px;height:24px;border:3px solid rgba(255,255,255,0.2);border-top-color:#3b82f6;border-radius:50%;animation:s .8s linear infinite}
-      @keyframes s{to{transform:rotate(360deg)}}</style></head>
-      <body><div style="text-align:center"><div class="s" style="margin:0 auto 16px"></div><p>Connecting to router...</p></div></body></html>`);
-  }
+  // ── Default: router management page ─────────────────────────────────
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(routerManagementPage());
 });
 
-// ── Compose stack scanner ───────────────────────────────────────────────────
-// Periodically checks the compose stack and reports status to the router.
-// If a managed container disappears, the router is notified.
+// ── Compose stack scanner ─────────────────────────────────────────────────
 
 const knownInstances = new Set();
 
-/** Auth headers for bridge→router API calls. Prefer BRIDGE_TOKEN, fall back to ROUTER_SECRET. */
-function bridgeAuthHeaders() {
-  if (BRIDGE_TOKEN) {
-    return { 'x-bridge-token': BRIDGE_TOKEN, 'x-bridge-id': INSTANCE_ID };
-  }
-  return { 'x-router-secret': ROUTER_SECRET };
-}
-
-/** Report a dead instance to the router. */
+/** Report a dead instance to all routers. */
 async function reportInstanceGone(instanceId) {
-  try {
-    const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/gone`, ROUTER_URL);
-    await fetch(url.toString(), { method: 'POST', headers: bridgeAuthHeaders() });
-    console.log(`[scanner] Reported instance gone: ${instanceId}`);
-  } catch (err) {
-    console.warn(`[scanner] Failed to report gone ${instanceId}: ${err.message}`);
+  const routers = loadRouters();
+  for (const r of routers) {
+    try {
+      const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/gone`, r.routerUrl);
+      await fetch(url.toString(), {
+        method: 'POST',
+        headers: { 'x-bridge-token': r.bridgeToken, 'x-bridge-id': r.bridgeId },
+      });
+    } catch { /* best effort */ }
   }
+  console.log(`[scanner] Reported instance gone: ${instanceId}`);
 }
 
-/** Report container status to the router (also links instance to this bridge). */
+/** Report container status to all routers. */
 async function reportInstanceStatus(instanceId, status) {
-  try {
-    const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/status`, ROUTER_URL);
-    await fetch(url.toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...bridgeAuthHeaders() },
-      body: JSON.stringify({ status, bridgeId: INSTANCE_ID }),
-    });
-  } catch { /* best effort */ }
+  const routers = loadRouters();
+  for (const r of routers) {
+    try {
+      const url = new URL(`/api/instances/${encodeURIComponent(instanceId)}/status`, r.routerUrl);
+      await fetch(url.toString(), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-bridge-token': r.bridgeToken,
+          'x-bridge-id': r.bridgeId,
+        },
+        body: JSON.stringify({ status, bridgeId: r.bridgeId }),
+      });
+    } catch { /* best effort */ }
+  }
 }
 
 async function scanStack() {
   const instances = compose.listInstances();
   const currentNames = new Set(instances.map(i => i.name));
 
-  // Check for instances that disappeared
   for (const name of knownInstances) {
     if (!currentNames.has(name)) {
       console.log(`[scanner] Instance ${name} disappeared from stack`);
@@ -593,7 +689,6 @@ async function scanStack() {
     }
   }
 
-  // Track and report current instances
   for (const inst of instances) {
     if (!knownInstances.has(inst.name)) {
       knownInstances.add(inst.name);
@@ -604,135 +699,37 @@ async function scanStack() {
   }
 }
 
-/** Retry registration until successful (router may not be ready on first boot).
- *  After exhausting retries, enters a slow-poll mode (every 5 min) instead of giving up. */
-async function registerWithRetry(maxRetries = 20, initialDelayMs = 5000) {
-  const maxDelayMs = 60000;
-  let delayMs = initialDelayMs;
-  let consecutiveNetworkErrors = 0;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    await registerBridge();
-    if (registered) {
-      console.log(`[pairing] Registered successfully on attempt ${attempt}`);
-      return;
-    }
-
-    consecutiveNetworkErrors++;
-    // If we get 5+ consecutive failures with same delay ceiling, the router is likely
-    // unreachable (wrong URL, DNS failure) — warn loudly
-    if (consecutiveNetworkErrors >= 5 && delayMs >= maxDelayMs) {
-      console.error(`[pairing] Router appears unreachable after ${consecutiveNetworkErrors} consecutive failures — check ROUTER_URL (${ROUTER_URL})`);
-    }
-
-    console.log(`[pairing] Registration attempt ${attempt}/${maxRetries} failed — retrying in ${delayMs / 1000}s`);
-    await new Promise(r => setTimeout(r, delayMs));
-    delayMs = Math.min(delayMs * 2, maxDelayMs);
-  }
-
-  console.error(`[pairing] Exhausted ${maxRetries} fast retries — entering slow-poll mode (every 5 min)`);
-
-  // Slow-poll: keep trying indefinitely at 5-minute intervals
-  const slowPollMs = 300000;
-  const slowPoll = async () => {
-    if (registered) return;
-    await registerBridge();
-    if (registered) {
-      console.log('[pairing] Registered successfully via slow-poll');
-      return;
-    }
-    setTimeout(slowPoll, slowPollMs);
-  };
-  setTimeout(slowPoll, slowPollMs);
-}
+// ── Startup ───────────────────────────────────────────────────────────────
 
 server.listen(PORT, '0.0.0.0', async () => {
   HOST_OS = await detectHostOs();
   console.log(`[pairing] Bridge v${BRIDGE_VERSION} listening on port ${PORT} (host: ${HOST_OS})`);
 
-  // ── Pairing code resolution ──────────────────────────────────────────
-  // If started with PAIRING_CODE (from docker command), resolve credentials from router.
-  if (PAIRING_CODE && !BRIDGE_TOKEN) {
-    const osType = HOST_OS;
-    let resolved = false;
-    for (let attempt = 1; attempt <= 10 && !resolved; attempt++) {
-      console.log(`[pairing] Resolving credentials from pairing code ${PAIRING_CODE}... (attempt ${attempt})`);
-      try {
-        const url = new URL('/api/bridges/claim-device', ROUTER_URL);
-        const resp = await fetch(url.toString(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code: PAIRING_CODE, osType, version: BRIDGE_VERSION }),
-        });
-        if (resp.status === 429) {
-          console.warn('[pairing] Rate limited — retrying in 5s...');
-          await new Promise(r => setTimeout(r, 5000));
-          continue;
-        }
-        if (resp.status === 410) {
-          console.error('[pairing] Pairing code has expired. Generate a new one from the app.');
-          process.exit(1);
-        }
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({ error: resp.statusText }));
-          console.error(`[pairing] Failed to resolve pairing code: ${err.error}`);
-          await new Promise(r => setTimeout(r, 3000));
-          continue;
-        }
-        const data = await resp.json();
-        INSTANCE_ID = data.bridgeId;
-        BRIDGE_TOKEN = data.bridgeToken;
-        resolved = true;
-        console.log(`[pairing] Resolved: bridge=${INSTANCE_ID}`);
-      } catch (err) {
-        console.error(`[pairing] Failed to contact router: ${err.message}`);
-        await new Promise(r => setTimeout(r, 5000));
-      }
-    }
-    if (!resolved) {
-      console.error('[pairing] Could not resolve pairing code after 10 attempts.');
-      process.exit(1);
-    }
-  }
+  // Register with all routers
+  await registerAllRouters();
 
-  // Generate a random ID if none resolved
-  if (!INSTANCE_ID) {
-    INSTANCE_ID = `xaiw-bridge-${crypto.randomBytes(8).toString('hex')}`;
-  }
-
-  if (BRIDGE_TOKEN) {
-    // Pre-provisioned: bridge was created via POST /api/bridges with user auth
-    await setupPreProvisioned();
-
-    // Watch for bridge_primary signal from bridge.js (router instructed us to become primary)
-    // If we have no host ports, recreate with ports in the background
-    let recreating = false;
-    const primaryCheckInterval = setInterval(async () => {
-      if (recreating) return;
-      if (!fs.existsSync('/data/bridge_primary')) return;
-      if (await needsPortBindings()) {
-        console.log('[bridge] Router confirmed primary — recreating with port bindings...');
-        recreating = true;
-        const ok = await recreateWithPorts();
-        recreating = false;
-        if (ok !== false) {
-          // Success — delete signal file, new container is running
-          try { fs.unlinkSync('/data/bridge_primary'); } catch {}
-          return;
-        }
-        // Recreation failed — keep signal file so interval retries
-        console.log('[bridge] Port binding failed, will retry');
-      } else {
+  // Watch for bridge_primary signal from bridge.js
+  let recreating = false;
+  const primaryCheckInterval = setInterval(async () => {
+    if (recreating) return;
+    if (!fs.existsSync('/data/bridge_primary')) return;
+    if (await needsPortBindings()) {
+      console.log('[bridge] Router confirmed primary — recreating with port bindings...');
+      recreating = true;
+      const ok = await recreateWithPorts();
+      recreating = false;
+      if (ok !== false) {
         try { fs.unlinkSync('/data/bridge_primary'); } catch {}
-        clearInterval(primaryCheckInterval); // already has ports, stop checking
+        return;
       }
-    }, 1000);
-  } else {
-    // Self-registration: bridge registers with ROUTER_SECRET
-    fetchRouterConfig().then(() => registerWithRetry());
-  }
+      console.log('[bridge] Port binding failed, will retry');
+    } else {
+      try { fs.unlinkSync('/data/bridge_primary'); } catch {}
+      clearInterval(primaryCheckInterval);
+    }
+  }, 1000);
 
-  // Start compose stack scanning after a short delay
+  // Start compose stack scanning
   setTimeout(() => {
     scanStack();
     setInterval(scanStack, SCAN_INTERVAL_MS);

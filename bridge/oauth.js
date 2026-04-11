@@ -1,52 +1,59 @@
 #!/usr/bin/env node
 /**
  * OAuth callback listener — intercepts OAuth redirects on provider ports and
- * forwards authorization codes to the router.
+ * forwards authorization codes to the correct router.
  *
  * Ports:
  *   54545 — Claude
  *    8085 — Gemini
  *    1455 — Codex
  *
- * Flow:
- *   1. OAuth provider redirects browser to http://localhost:{port}?code=XXX&state=YYY
- *   2. This listener validates the state parameter format (defense-in-depth)
- *   3. Forwards { code, state } to POST {ROUTER_URL}/oauth/bridge/{provider}
- *   4. Returns success/error HTML to the browser
+ * Multi-router flow:
+ *   1. Router sends `expect_oauth { provider, routerUrl, routerSecret }` to bridge.js
+ *   2. bridge.js writes to /data/pending_oauth.json
+ *   3. OAuth provider redirects browser to http://localhost:{port}?code=XXX[&state=YYY]
+ *   4. This listener reads pending_oauth.json to find the target router
+ *   5. Forwards { code, state } to POST {routerUrl}/oauth/bridge/{provider}
+ *   6. Returns success/error HTML to the browser
  */
 const http = require('http');
 const fs = require('fs');
 const { URL } = require('url');
 
-const ROUTER_URL = process.env.ROUTER_URL;
-if (!ROUTER_URL) {
-  console.error('[oauth] FATAL: ROUTER_URL is required');
-  process.exit(1);
+const ROUTERS_FILE = '/data/routers.json';
+const PENDING_OAUTH_FILE = '/data/pending_oauth.json';
+
+/**
+ * Get pending OAuth entry for a provider (written by bridge.js).
+ * Looks up by provider:state first (precise match), then provider (fallback).
+ * Returns { routerUrl } or null if expired/missing.
+ */
+function getPendingOAuth(provider, state) {
+  try {
+    const pending = JSON.parse(fs.readFileSync(PENDING_OAUTH_FILE, 'utf8'));
+    // Try precise match first (provider:state)
+    if (state) {
+      const precise = pending[`${provider}:${state}`];
+      if (precise && (Date.now() - precise.ts) < 600_000) return precise;
+    }
+    // Fall back to provider-only key
+    const entry = pending[provider];
+    if (entry && (Date.now() - entry.ts) < 600_000) return entry;
+  } catch {}
+  return null;
 }
 
-const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
-
-// Read router secret: env var first, then Docker secret file
-const SECRETS_FILE_PATH = '/run/secrets/router_secret';
-const ROUTER_SECRET = process.env.ROUTER_SECRET
-  || (() => {
-    try { return fs.readFileSync(SECRETS_FILE_PATH, 'utf8').trim(); }
-    catch { return ''; }
-  })();
-
-if (!ROUTER_SECRET) {
-  console.warn('[oauth] WARNING: ROUTER_SECRET not set — OAuth callbacks will be rejected');
+/**
+ * Get bridge credentials for a specific router URL from routers.json.
+ * Returns { bridgeId, bridgeToken } or null.
+ */
+function getRouterCredentials(routerUrl) {
+  try {
+    const routers = JSON.parse(fs.readFileSync(ROUTERS_FILE, 'utf8'));
+    return routers.find(r => r.routerUrl === routerUrl) || null;
+  } catch {}
+  return null;
 }
-
-// Allowed CORS origins — restrict to known app URLs and localhost for dev
-const ALLOWED_ORIGINS = new Set([
-  APP_URL,
-  ROUTER_URL,
-  'http://localhost:4200',
-  'http://localhost:3000',
-  'https://xaiworkspace.com',
-  'https://app-test.xaiworkspace.com',
-]);
 
 // Provider → port mapping
 const PROVIDERS = [
@@ -56,7 +63,6 @@ const PROVIDERS = [
 ];
 
 // Validation constants
-const MIN_STATE_LENGTH = 8;
 const MAX_CODE_LENGTH = 2048;
 const MAX_RETRIES = 5;
 
@@ -100,40 +106,45 @@ const ERROR_HTML = `<!DOCTYPE html>
 </html>`;
 
 /**
- * Validate OAuth state parameter format (defense-in-depth).
- * Accepts alphanumeric + URL-safe chars including base64url.
- * The router performs the authoritative state check server-side.
- */
-function isValidState(state) {
-  if (!state || state.length < MIN_STATE_LENGTH) return false;
-  // Allow alphanumeric, dash, underscore, dot, tilde, plus, slash, equals (base64)
-  return /^[a-zA-Z0-9\-_\.~+/=]+$/.test(state);
-}
-
-/**
  * Validate OAuth authorization code format.
  */
 function isValidCode(code) {
   if (!code || typeof code !== 'string') return false;
   if (code.length > MAX_CODE_LENGTH) return false;
-  // Authorization codes are typically alphanumeric + URL-safe characters
   return /^[a-zA-Z0-9\-_\.~+/=]+$/.test(code);
 }
 
 /**
- * Forward OAuth code to the router for token exchange.
+ * Forward OAuth code to the correct router for token exchange.
+ * Uses pending_oauth.json to determine which router initiated the flow.
  */
 async function forwardToRouter(provider, code, state) {
-  const url = `${ROUTER_URL}/oauth/bridge/${encodeURIComponent(provider)}`;
+  const pending = getPendingOAuth(provider, state);
+  if (!pending?.routerUrl) {
+    throw new Error(`No pending OAuth for ${provider} — expect_oauth may have been missed or expired`);
+  }
+  const routerUrl = pending.routerUrl;
+
+  // Authenticate with per-bridge credentials (bridgeToken) for this specific router.
+  const creds = getRouterCredentials(routerUrl);
+  if (!creds) {
+    throw new Error(`No credentials for router ${routerUrl} — not registered in routers.json`);
+  }
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-bridge-token': creds.bridgeToken,
+    'x-bridge-id': creds.bridgeId,
+  };
+
+  const url = `${routerUrl}/oauth/bridge/${encodeURIComponent(provider)}`;
   const body = { code };
   if (state) body.state = state;
 
+  console.log(`[oauth] ${provider}: forwarding to ${routerUrl}`);
+
   const resp = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-router-secret': ROUTER_SECRET,
-    },
+    headers,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
   });
@@ -149,11 +160,6 @@ async function forwardToRouter(provider, code, state) {
  */
 function startProviderListener(provider, port, attempt = 1) {
   const server = http.createServer(async (req, res) => {
-    // CORS: restrict to known origins (matching server.js pattern)
-    const origin = req.headers.origin || '';
-    if (ALLOWED_ORIGINS.has(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-    }
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
 
@@ -184,14 +190,6 @@ function startProviderListener(provider, port, attempt = 1) {
       return;
     }
 
-    // Reject early if ROUTER_SECRET is not configured
-    if (!ROUTER_SECRET) {
-      console.error(`[oauth] ${provider}: callback rejected — ROUTER_SECRET not configured`);
-      res.writeHead(503, { 'Content-Type': 'text/html' });
-      res.end(ERROR_HTML);
-      return;
-    }
-
     // Validate code parameter
     if (!isValidCode(code)) {
       console.error(`[oauth] ${provider}: callback rejected — invalid code format (length=${code.length})`);
@@ -200,15 +198,10 @@ function startProviderListener(provider, port, attempt = 1) {
       return;
     }
 
-    // Validate state parameter (defense-in-depth, router does authoritative check)
-    if (!isValidState(state)) {
-      console.error(`[oauth] Callback for ${provider} rejected: invalid or missing state`);
-      res.writeHead(400, { 'Content-Type': 'text/html' });
-      res.end(ERROR_HTML);
-      return;
-    }
+    // Note: state is optional — some providers (Claude) may not return it.
+    // Do not reject callbacks without state.
 
-    // Forward to router
+    // Forward to the correct router
     try {
       await forwardToRouter(provider, code, state);
       console.log(`[oauth] ${provider}: callback forwarded successfully`);
@@ -244,4 +237,4 @@ for (const { name, port } of PROVIDERS) {
   startProviderListener(name, port);
 }
 
-console.log('[oauth] OAuth callback listeners started');
+console.log('[oauth] OAuth callback listeners started (multi-router)');

@@ -76,7 +76,7 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
 
     // Build config from the deep link parameters
     let mut cfg = config::DesktopConfig {
-        router_url,
+        router_urls: vec![router_url],
         app_url,
         ..Default::default()
     };

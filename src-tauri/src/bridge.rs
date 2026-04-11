@@ -73,7 +73,7 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
         if !running.is_empty() {
             let bridge_name = running[0];
             eprintln!("[bridge] Bridge already running: {bridge_name} — reusing");
-            let router_url = &cfg.router_url;
+            let router_url = cfg.router_urls.first().map(|s| s.as_str()).unwrap_or("https://router.xaiworkspace.com");
 
             if let Some(jwt) = token {
                 // Query the router API for bridge status — avoids depending on the container's
@@ -118,7 +118,8 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
     let _ = Command::new("docker").args(["pull", image]).status();
 
     let jwt = token.ok_or("JWT token required to create a bridge — launch via deep link")?;
-    let router_url = &cfg.router_url;
+    let router_url = cfg.router_urls.first().map(|s| s.as_str()).unwrap_or("https://router.xaiworkspace.com");
+    let router_urls_env = cfg.router_urls.join(",");
 
     // Create bridge server-side — gets per-bridge BRIDGE_TOKEN (not the master ROUTER_SECRET)
     let provision = provision_bridge(router_url, jwt).await?;
@@ -156,7 +157,7 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
                 "-e", &format!("BRIDGE_ID={name}"),
                 "-e", &format!("BRIDGE_TOKEN={}", provision.bridge_token),
-                "-e", &format!("ROUTER_URL={router_url}"),
+                "-e", &format!("ROUTER_URLS={router_urls_env}"),
                 "-e", &format!("APP_URL={app_url}"),
                 image,
             ])
@@ -176,7 +177,7 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "-p", "1455:1455",     // Codex OAuth callback
                 "-e", &format!("BRIDGE_ID={name}"),
                 "-e", &format!("BRIDGE_TOKEN={}", provision.bridge_token),
-                "-e", &format!("ROUTER_URL={router_url}"),
+                "-e", &format!("ROUTER_URLS={router_urls_env}"),
                 "-e", &format!("APP_URL={app_url}"),
                 image,
             ])
