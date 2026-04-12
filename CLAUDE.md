@@ -20,18 +20,35 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg
 
 ### Bridge Docker image
 
+The bridge image is **multi-arch** (`linux/amd64` + `linux/arm64`) as of `bridge-v0.21.0`. The Dockerfile requires `TARGETARCH` to be set, so it must be built via `docker buildx` (plain `docker build` will fail with an explicit error).
+
 ```bash
-docker build -f Dockerfile.bridge -t xaiworkspace-bridge:latest .
+# Local build for native platform (single-arch test)
+docker buildx build --platform linux/amd64 -f Dockerfile.bridge -t xaiworkspace-bridge:latest --load .
 ```
 
 ### Publishing the bridge image to ECR
 
 ```bash
-./scripts/push-bridge.sh              # Build, tag bridge-vX.Y.Z + bridge-latest, push to ECR, notify routers
-./scripts/push-bridge.sh --skip-build # Push only (image already built locally)
+./scripts/push-bridge.sh              # Build + push multi-arch (amd64 + arm64), notify routers
 ```
 
-The script reads the version from `bridge/package.json`, tags the image as both `bridge-vX.Y.Z` and `bridge-latest`, pushes to `public.ecr.aws/s3b3q6t2/xaiworkspace-docker`, then calls `POST /api/webhooks/ecr-push` on each router (test + prod) to trigger an immediate version refresh. Set `ECR_WEBHOOK_SECRET` in the environment for router notification; omit to skip the notification step.
+The script:
+1. Reads version from `bridge/package.json`
+2. Verifies ECR Public credentials are present (fails fast with a login hint if missing)
+3. Registers QEMU binfmt handlers if not already loaded (survives host reboots; volatile kernel state)
+4. Auto-provisions an isolated buildx builder `xaiw-bridge-builder` (`docker-container` driver) on first run — does **not** mutate your default buildx builder
+5. Builds `linux/amd64` + `linux/arm64` in one invocation, tags as both `bridge-vX.Y.Z` and `bridge-latest`, and pushes a single manifest list to `public.ecr.aws/s3b3q6t2/xaiworkspace-docker`
+6. Optionally calls `POST /api/webhooks/ecr-push` on each router if `ECR_WEBHOOK_SECRET` is set (otherwise routers pick up the new version on their 30-min ECR poll)
+
+**Prerequisites** (first run only, auto-handled):
+- `docker buildx` (ships with Docker 20.10+)
+- QEMU binfmt handlers (`tonistiigi/binfmt` — installed by the script under `--privileged`)
+- ECR Public login: `aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws` (tokens last ~12h — refresh before each release)
+
+**Dockerfile notes**:
+- `COMPOSE_VERSION` ARG pins the docker-compose v2 plugin version; the binary is downloaded per `TARGETARCH` during build and verified against the upstream `.sha256`
+- `--skip-build` was removed in the multi-arch rewrite (build + push are a single buildx step — you can't `docker load` a multi-arch manifest list)
 
 ## Architecture
 

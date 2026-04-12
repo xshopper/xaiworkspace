@@ -112,17 +112,17 @@ OAuth ports are on by default. If the bridge container maps the same ports, Taur
 
 ## Bridge Docker image
 
-The bridge image is built from `Dockerfile.bridge` and published to ECR:
+The bridge image is **multi-arch** (`linux/amd64` + `linux/arm64`) and published from `Dockerfile.bridge` to `public.ecr.aws/s3b3q6t2/xaiworkspace-docker`.
 
 ```bash
-# Build locally
-docker build -f Dockerfile.bridge -t xaiworkspace-bridge:latest .
+# One-time ECR login (token lasts ~12h)
+aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
 
-# Push to ECR
-aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/s3b3q6t2
-docker tag xaiworkspace-bridge:latest public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest
-docker push public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest
+# Build + push multi-arch manifest (both tags: bridge-vX.Y.Z + bridge-latest)
+./scripts/push-bridge.sh
 ```
+
+First run auto-provisions a buildx builder and registers QEMU binfmt handlers for cross-arch builds. See `CLAUDE.md` for details, including the local single-arch test command.
 
 ## Code signing
 
