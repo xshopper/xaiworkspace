@@ -1,10 +1,33 @@
 FROM node:22-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl docker.io && rm -rf /var/lib/apt/lists/* \
+ARG TARGETARCH
+# Bump periodically for upstream security patches; must match a published release at
+# https://github.com/docker/compose/releases (binary + .sha256 asset required).
+ARG COMPOSE_VERSION=v2.32.4
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates docker.io && rm -rf /var/lib/apt/lists/* \
     && npm install -g pm2
 
-# Docker Compose v2 plugin (pre-downloaded)
-COPY bridge/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+# Docker Compose v2 plugin — downloaded per target arch with SHA256 verification (multi-arch build support)
+RUN set -eux; \
+    if [ -z "${TARGETARCH:-}" ]; then \
+      echo "ERROR: TARGETARCH not set — this Dockerfile requires buildx (docker buildx build --platform ...)" >&2; \
+      exit 1; \
+    fi; \
+    case "$TARGETARCH" in \
+      amd64) COMPOSE_ARCH=x86_64 ;; \
+      arm64) COMPOSE_ARCH=aarch64 ;; \
+      *) echo "ERROR: Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /usr/local/lib/docker/cli-plugins; \
+    COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}"; \
+    curl -fsSL "$COMPOSE_URL" -o /usr/local/lib/docker/cli-plugins/docker-compose; \
+    curl -fsSL "${COMPOSE_URL}.sha256" -o /tmp/docker-compose.sha256; \
+    EXPECTED_SHA=$(awk '{print $1}' /tmp/docker-compose.sha256); \
+    echo "${EXPECTED_SHA}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c -; \
+    rm -f /tmp/docker-compose.sha256; \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; \
+    /usr/local/lib/docker/cli-plugins/docker-compose version
 
 WORKDIR /opt/bridge
 
