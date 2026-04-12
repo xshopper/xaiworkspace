@@ -52,6 +52,11 @@ const PORT = parseInt(process.env.PAIRING_PORT || '3100', 10);
 const APP_URL = process.env.APP_URL || 'https://xaiworkspace.com';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10);
 
+// PAIRING_CODE: short-lived code (5-min TTL) from a user-facing "add bridge"
+// flow. When set, the bridge claims credentials via /api/bridges/claim-device
+// instead of /api/bridges/register (which requires ROUTER_SECRET).
+const PAIRING_CODE = process.env.PAIRING_CODE || '';
+
 // Domain allowlist for adding new routers
 const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
 
@@ -263,6 +268,52 @@ async function recreateWithPorts() {
 // ── Router registration ──────────────────────────────────────────────────
 
 /**
+ * Exchange a pairing code for bridge credentials (user-pairing flow).
+ * Used when PAIRING_CODE env var is set (e.g. from the frontend's "Add bridge"
+ * docker-run command). The pairing code IS the auth — no ROUTER_SECRET needed.
+ * Returns { routerUrl, bridgeId, bridgeToken, pairingCode } or null.
+ */
+async function claimDeviceWithCode(routerUrl) {
+  try {
+    const url = new URL('/api/bridges/claim-device', routerUrl);
+    const resp = await fetch(url.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: PAIRING_CODE,
+        osType: HOST_OS,
+        version: BRIDGE_VERSION,
+      }),
+    });
+
+    if (resp.status === 410) {
+      console.error(`[pairing] Pairing code has expired for ${routerUrl}. Generate a new one from the app.`);
+      return null;
+    }
+    if (resp.status === 404) {
+      console.error(`[pairing] Invalid pairing code for ${routerUrl}. Check the code and try again.`);
+      return null;
+    }
+    if (!resp.ok) {
+      const err = await resp.text();
+      console.error(`[pairing] Claim failed for ${routerUrl}: ${resp.status} ${err}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    return {
+      routerUrl,
+      bridgeId: data.bridgeId,
+      bridgeToken: data.bridgeToken,
+      pairingCode: data.pairingCode,
+    };
+  } catch (err) {
+    console.error(`[pairing] Failed to claim with ${routerUrl}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Register with a single router. Returns { routerUrl, bridgeId, bridgeToken, pairingCode } or null.
  */
 async function registerWithRouter(routerUrl) {
@@ -316,17 +367,21 @@ async function registerAllRouters() {
     return;
   }
 
-  console.log(`[pairing] Registering with ${toRegister.length} new router(s) concurrently...`);
+  // Pick credential-acquisition method: PAIRING_CODE (user pairing, no router
+  // secret needed) or ROUTER_SECRET-authenticated register (privileged bridges).
+  const acquire = PAIRING_CODE ? claimDeviceWithCode : registerWithRouter;
+  const verb = PAIRING_CODE ? 'Claiming with' : 'Registering with';
+  console.log(`[pairing] ${verb} ${toRegister.length} new router(s) concurrently...`);
 
   async function registerWithRetries(routerUrl) {
     for (let attempt = 1; attempt <= 10; attempt++) {
-      const result = await registerWithRouter(routerUrl);
+      const result = await acquire(routerUrl);
       if (result) return result;
       const delay = Math.min(5000 * attempt, 30000);
       console.log(`[pairing] Retry ${attempt}/10 for ${routerUrl} in ${delay / 1000}s`);
       await new Promise(r => setTimeout(r, delay));
     }
-    console.error(`[pairing] Failed to register with ${routerUrl} after 10 attempts`);
+    console.error(`[pairing] Failed to ${PAIRING_CODE ? 'claim' : 'register'} with ${routerUrl} after 10 attempts`);
     return null;
   }
 
