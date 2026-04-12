@@ -287,6 +287,7 @@ async function checkForUpdate() {
 
   if (!runningImageId || !pulledImageId || runningImageId === pulledImageId) {
     console.log(`[updater] Image is up to date`);
+    sendUpdateProgress('idle', 'Bridge is up to date');
     return;
   }
 

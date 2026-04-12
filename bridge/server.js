@@ -163,12 +163,9 @@ function dockerApiDelete(path) {
   });
 }
 
-// Ports required for OAuth callbacks and pairing redirect
+// Ports required for pairing redirect (OAuth moved to workspace CLIProxyAPI)
 const BRIDGE_PORTS = [
   { container: 3100, host: 3100 },
-  { container: 54545, host: 54545 },
-  { container: 8085, host: 8085 },
-  { container: 1455, host: 1455 },
 ];
 
 async function needsPortBindings() {

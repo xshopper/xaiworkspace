@@ -10,35 +10,12 @@ const WebSocket = require('ws');
 const fs = require('fs');
 
 const ROUTERS_FILE = '/data/routers.json';
-const PENDING_OAUTH_FILE = '/data/pending_oauth.json';
-
-// Domain allowlist for validating routerUrl in expect_oauth messages
-const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
-
-function isAllowedRouterUrl(routerUrl) {
-  try {
-    const { hostname } = new URL(routerUrl);
-    return ALLOWED_ROUTER_DOMAINS.some(d =>
-      d.startsWith('.') ? hostname.endsWith(d) || hostname === d.slice(1) : hostname === d
-    );
-  } catch { return false; }
-}
 
 // ── Multi-router connection state ─────────────────────────────────────────
 // routerUrl → { ws, bridgeId, bridgeToken, authenticated, pingInterval, reconnectTimer }
 const connections = new Map();
 let shuttingDown = false;
 let primaryHandled = false;
-
-function readPendingOAuth() {
-  try { return JSON.parse(fs.readFileSync(PENDING_OAUTH_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function atomicWrite(path, data) {
-  const tmp = path + '.tmp';
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, path);
-}
 
 // ── Load routers from /data/routers.json ──────────────────────────────────
 function loadRouters() {
@@ -178,36 +155,6 @@ function handleMessage(msg, conn, routerUrl) {
   // All other commands require authentication
   if (!conn.authenticated) {
     console.warn(`[bridge] Ignoring ${msg.type} from ${routerUrl} — not authenticated`);
-    return;
-  }
-
-  // ── OAuth coordination ────────────────────────────────────────────────
-  if (msg.type === 'expect_oauth') {
-    // Validate routerUrl from message against allowlist
-    if (!msg.routerUrl || !isAllowedRouterUrl(msg.routerUrl)) {
-      console.warn(`[bridge] Rejected expect_oauth with disallowed routerUrl: ${msg.routerUrl}`);
-      return;
-    }
-    // Key by provider:state when state is available (prevents collision when
-    // multiple users OAuth the same provider simultaneously). Falls back to
-    // provider-only key when state is absent (Claude doesn't return state).
-    const key = msg.state ? `${msg.provider}:${msg.state}` : msg.provider;
-    console.log(`[bridge] OAuth expected: ${key} → ${msg.routerUrl}`);
-    const pending = readPendingOAuth();
-    pending[key] = { routerUrl: msg.routerUrl, ts: Date.now() };
-    // Provider-only fallback only for Claude (the only provider that omits state).
-    // For other providers, the state-keyed entry is sufficient and avoids collisions.
-    if (!msg.state) pending[msg.provider] = { routerUrl: msg.routerUrl, ts: Date.now() };
-    atomicWrite(PENDING_OAUTH_FILE, JSON.stringify(pending));
-    return;
-  }
-  if (msg.type === 'close_oauth') {
-    console.log(`[bridge] OAuth cleared: ${msg.provider}`);
-    const pending = readPendingOAuth();
-    // Clean up both keyed and provider-only entries
-    delete pending[msg.provider];
-    if (msg.state) delete pending[`${msg.provider}:${msg.state}`];
-    atomicWrite(PENDING_OAUTH_FILE, JSON.stringify(pending));
     return;
   }
 

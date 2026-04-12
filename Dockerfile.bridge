@@ -15,7 +15,7 @@ COPY bridge/ ./
 
 RUN mkdir -p /data
 
-EXPOSE 3100 54545 8085 1455
+EXPOSE 3100
 
 HEALTHCHECK --interval=5s --timeout=3s CMD curl -sf http://localhost:3100/health || exit 1
 

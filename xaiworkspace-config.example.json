@@ -1,11 +1,6 @@
 {
   "bridgeImage": "xaiworkspace-bridge:latest",
-  "bridgePorts": [3101, 54546, 8086, 1456],
-  "oauthProviders": [
-    { "name": "claude", "port": 54546 },
-    { "name": "gemini", "port": 8086 },
-    { "name": "codex", "port": 1456 }
-  ],
+  "bridgePorts": [3101],
   "routerUrl": "http://localhost:8080",
   "appUrl": "http://localhost:4200",
   "composeDir": "../xaiworkspace-docker"
