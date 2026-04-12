@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Lightweight Tauri 2 desktop app (Rust + HTML) that sits in the system tray. Three jobs: install Docker, run the bridge container, and intercept OAuth callbacks. Not smart — the router is the brain.
+Lightweight Tauri 2 desktop app (Rust + HTML) that sits in the system tray. Two jobs: install Docker and run the bridge container via deep link. Not smart — the router is the brain. OAuth is handled by the workspace CLIProxyAPI (not the Tauri app).
 
 ## Key Commands
 
@@ -57,21 +57,19 @@ The script:
 | `config.rs` | Load config: local file > router API > defaults | `DesktopConfig` struct |
 | `docker.rs` | Detect/install Docker Desktop per platform | `is_available()`, `install()` |
 | `bridge.rs` | Pull image, create/start container, health check, mount secrets | `run()`, `wait_for_health()` |
-| `oauth.rs` | TCP listeners on OAuth callback ports, state validation, forward to router | `OAuthManager` with toggle + `pending_states` |
-| `tray.rs` | System tray with OAuth port toggles | `CheckMenuItem` per provider |
-| `lib.rs` | Setup flow orchestration, single instance guard | `run_setup()` |
+| `tray.rs` | System tray menu (quit) | Minimal tray |
+| `lib.rs` | Setup flow orchestration, deep link provisioning, single instance guard | `run_setup()`, `handle_provision()` |
 
 ## File Structure
 
 ```
 src-tauri/src/
   main.rs          # Entry point → lib::run()
-  lib.rs           # Setup flow, single instance, Tauri builder
+  lib.rs           # Setup flow, deep link provisioning, single instance, Tauri builder
   config.rs        # Config loading (local file / router API / defaults)
   docker.rs        # Docker detection + platform-specific install
   bridge.rs        # Container lifecycle (pull, run, health, open browser)
-  oauth.rs         # OAuthManager + TCP listeners with CancellationToken
-  tray.rs          # System tray menu with per-provider toggles
+  tray.rs          # System tray menu
 src/
   index.html       # Progress bar UI (dark theme)
 bridge/
@@ -96,14 +94,12 @@ Priority: local file > router API > defaults.
 
 **Router API**: `GET /api/config/desktop` returns `DesktopConfig` JSON.
 
-**Fields**: `bridgeImage`, `bridgePorts`, `oauthProviders[{name,port}]`, `routerUrl`, `appUrl`.
+**Fields**: `bridgeImage`, `bridgePorts`, `routerUrl`, `appUrl`. (Note: `oauthProviders` removed — OAuth is now handled by workspace CLIProxyAPI via WS.)
 
 ## Key Patterns
 
 - **Single instance**: `tauri-plugin-single-instance` — second launch focuses existing window
-- **OAuth toggle**: `OAuthManager` uses `CancellationToken` per listener; tray `CheckMenuItem` toggles on/off
-- **OAuth state validation**: Callbacks require a state parameter (min 8 chars, alphanumeric + `-_~.`). States registered by this app are consumed on first use; externally-initiated states are format-validated as defense-in-depth (router does authoritative check)
-- **Port conflict**: Bridge container maps OAuth ports; Tauri listeners silently skip bound ports (EADDRINUSE)
+- **Deep link provisioning**: `xaiworkspace://provision?router=URL&app=URL&token=JWT` triggers bridge container creation from the web app's "Add System" flow. 5-second dedup window prevents duplicate OS handler invocations on Linux
 - **Admin elevation**: macOS `osascript`, Windows `PowerShell RunAs`, Linux `pkexec`/`sudo`
 - **FUSE bypass**: AppImage uses `--appimage-extract-and-run` on GNOME 46+ (no executable double-click)
 
@@ -119,15 +115,20 @@ Priority: local file > router API > defaults.
 ## Setup Flow (lib.rs → run_setup)
 
 ```
-1. Load config (local file > router > defaults)
+1. Check Docker → report if missing
+2. Set up system tray
+3. Hide window → tray
+4. Wait for deep link (xaiworkspace://provision?router=URL&app=URL&token=JWT)
+```
+
+**Deep link provisioning** (lib.rs → handle_provision):
+```
+1. Validate JWT token from deep link params
 2. Fetch versioned bridge image tag from GET /api/config/desktop
-3. Set up tray with OAuth toggles
-4. Check Docker → install if missing (platform-specific, elevated)
-5. Check bridge container → pull versioned image + create if missing (with PAIRING_CODE)
-6. Wait for health (localhost:3100/health)
-7. Open browser (bridge redirects to /link?code=XXXX for pairing)
-8. Hide window → tray
-9. Start OAuth listeners (all on, skip ports bound by bridge)
+3. Check Docker → install if missing (platform-specific, elevated)
+4. Pull versioned bridge image + create container (with PAIRING_CODE)
+5. Wait for health (localhost:3100/health)
+6. Open browser (bridge redirects to /link?code=XXXX for pairing)
 ```
 
 ## Bridge Container
@@ -138,7 +139,7 @@ Runs two pm2 processes:
 - `pairing-server` (server.js) — health endpoint + pairing code redirect on port 3100. Registers bridge with router, writes auth credentials to `/data/auth.json`.
 - `bridge` (bridge.js) — WebSocket bridge between router and local gateway. Reads auth from `AUTH_JSON` env var first, then falls back to `/data/auth.json`. Re-reads credentials on each reconnect attempt so it picks up tokens written by the pairing server. Waits gracefully if no credentials are available yet.
 
-Ports mapped: 3100 (pairing), 54545 (Claude OAuth), 8085 (Gemini), 1455 (Codex)
+Ports mapped: 3100 (pairing/health only). OAuth callback ports (54545, 8085, 1455) were removed — OAuth is now handled by the workspace CLIProxyAPI with callbacks delivered via WS (`cliproxy_oauth_callback`)
 
 Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind mount from host temp file). `server.js` reads secret file first, falls back to env var.
 
