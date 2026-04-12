@@ -142,7 +142,7 @@ Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind 
 The application icon is "X-Dot" — an X shape with a single dot above it. **Not** three dots.
 
 Icon files in `src-tauri/icons/`:
-- `tray-icon.png` / `tray-icon@2x.png` — system tray icon
+- `tray-icon.png`, `tray-icon-dark.png`, `tray-icon-light.png` — system tray icons (theme-aware)
 - `32x32.png`, `128x128.png`, `128x128@2x.png` — app window icons
 - `icon.icns` (macOS), `icon.ico` (Windows), `icon.png` — bundle icons
 

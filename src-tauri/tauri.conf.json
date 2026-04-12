@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src https://router.xaiworkspace.com https://router-test.xaiworkspace.com https://desktop.docker.com http://localhost:*; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src https://router.xaiworkspace.com https://test-router.xaiworkspace.com https://desktop.docker.com http://localhost:*; style-src 'self' 'unsafe-inline'"
     }
   },
   "plugins": {

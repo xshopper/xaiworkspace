@@ -5851,7 +5851,7 @@ dependencies = [
 
 [[package]]
 name = "xaiworkspace"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "open",
  "reqwest 0.12.28",
@@ -5864,7 +5864,6 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tokio",
- "tokio-util",
  "url",
 ]
 

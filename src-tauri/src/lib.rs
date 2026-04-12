@@ -5,13 +5,6 @@ mod tray;
 
 use tauri::{AppHandle, Emitter, Manager};
 
-#[tauri::command]
-fn get_status() -> serde_json::Value {
-    serde_json::json!({
-        "docker": docker::is_available(),
-    })
-}
-
 /// Startup: check Docker availability, then sit in tray.
 /// Docker installation is the user's responsibility — the frontend Settings page
 /// shows Docker install instructions in the "Add System → Docker" tab.
@@ -217,7 +210,6 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![get_status])
         .setup(|app| {
             // Set up system tray (minimal — just "Open" + bridge status + "Quit")
             if let Err(e) = tray::setup(app.handle()) {

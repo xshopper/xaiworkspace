@@ -172,9 +172,6 @@ pub async fn create_new_bridge(cfg: &DesktopConfig, token: Option<&str>) -> Resu
                 "--restart", "unless-stopped",
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
                 "-p", "3100:3100",     // Pairing server
-                "-p", "54545:54545",   // Claude OAuth callback
-                "-p", "8085:8085",     // Gemini OAuth callback
-                "-p", "1455:1455",     // Codex OAuth callback
                 "-e", &format!("BRIDGE_ID={name}"),
                 "-e", &format!("BRIDGE_TOKEN={}", provision.bridge_token),
                 "-e", &format!("ROUTER_URLS={router_urls_env}"),
@@ -235,14 +232,10 @@ async fn get_bridge_info(router_url: &str, token: &str, bridge_name: &str) -> Br
         Ok(r) if r.status().is_success() => {
             if let Ok(json) = r.json::<serde_json::Value>().await {
                 if let Some(arr) = json["instances"].as_array() {
-                    if let Some(bridge) = arr.iter().find(|i| {
+                    if arr.iter().any(|i| {
                         i["instanceId"].as_str() == Some(bridge_name) && i["isBridge"].as_bool() == Some(true)
                     }) {
                         // Bridge is in user's instances list — they're a member
-                        // But also grab the pairing code in case we need it
-                        if bridge["pairingCode"].as_str().is_some_and(|c| !c.is_empty()) {
-                            return BridgeInfo::Member;
-                        }
                         return BridgeInfo::Member;
                     }
                     // Bridge not in user's list — check if any bridge has a pairing code we can use

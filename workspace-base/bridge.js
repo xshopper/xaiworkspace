@@ -108,7 +108,7 @@ function reportInstalledApps() {
     const list = execSync('pm2 jlist --no-color', { encoding: 'utf-8', timeout: 5000 });
     const procs = JSON.parse(list);
     // Filter out system processes — only report installed apps
-    const systemProcs = new Set(['bootstrap-bridge', 'bridge', 'updater']);
+    const systemProcs = new Set(['workspace-agent', 'bridge', 'updater']);
     const apps = procs
       .filter(p => !systemProcs.has(p.name))
       .map(p => ({
@@ -428,7 +428,7 @@ async function handleSelfUpdate(msg) {
     await new Promise(resolve => setTimeout(resolve, 200));
 
     try {
-      execFileSync('pm2', ['restart', 'bootstrap-bridge'], { timeout: 10000 });
+      execFileSync('pm2', ['restart', 'workspace-agent'], { timeout: 10000 });
       // Unreachable on success — process is replaced. backupPath cleaned by entrypoint on next boot.
     } catch (restartErr) {
       // pm2 restart failed — files are already updated but process is still running.
@@ -794,7 +794,6 @@ function handleUninstallApp(msg) {
     }
 
     // Stop pm2 processes for this app (use execFileSync to avoid shell injection)
-    try { execFileSync('pm2', ['delete', `app-${slug}`], { timeout: 10000 }); } catch {}
     try { execFileSync('pm2', ['delete', slug], { timeout: 10000 }); } catch {}
 
     // Remove app-specific env vars from secrets.env before deleting the directory
@@ -876,11 +875,7 @@ function handleRestartApp(msg) {
 
   try {
     // Use execFileSync to avoid shell injection
-    try {
-      execFileSync('pm2', ['restart', slug], { timeout: 10000 });
-    } catch {
-      execFileSync('pm2', ['restart', `app-${slug}`], { timeout: 10000 });
-    }
+    execFileSync('pm2', ['restart', slug], { timeout: 10000 });
     send({ type: 'restart_result', id, slug, status: 'ok' });
   } catch (err) {
     send({ type: 'restart_result', id, slug, status: 'error', error: err.message });

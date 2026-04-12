@@ -89,8 +89,6 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             format!("Failed to load tray icon: {e}").into()
         })?;
 
-    let bridge_status_item = bridge_item.clone();
-
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
@@ -110,7 +108,7 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     // Periodically update bridge status via Docker CLI (local only, no network)
-    let status_item = bridge_status_item;
+    let status_item = bridge_item.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;

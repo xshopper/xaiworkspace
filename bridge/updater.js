@@ -89,14 +89,6 @@ function getContainerImage(containerId) {
   } catch { return null; }
 }
 
-function getLocalDigest(image) {
-  try {
-    return execFileSync('docker', [
-      'inspect', '--format', '{{index .RepoDigests 0}}', image,
-    ], { encoding: 'utf-8', timeout: 10000 }).trim();
-  } catch { return null; }
-}
-
 function pullImage(image) {
   try {
     execFileSync('docker', ['pull', image], { timeout: 300000, stdio: 'pipe' });
