@@ -88,13 +88,13 @@ config/
 
 ## Config System
 
-Priority: local file > router API > defaults.
+Priority: local file > deep link params > defaults. (Router API config fetch removed — provisioning is now deep-link driven.)
 
 **Local file**: `xaiworkspace-config.json` next to the executable. Use `config/dev.json` or `config/test.json`.
 
-**Router API**: `GET /api/config/desktop` returns `DesktopConfig` JSON.
+**Deep link params**: `xaiworkspace://provision?router=URL&app=URL&token=JWT&image=TAG` — overrides routerUrls, appUrl, and bridgeImage from the deep link.
 
-**Fields**: `bridgeImage`, `bridgePorts`, `routerUrl`, `appUrl`. (Note: `oauthProviders` removed — OAuth is now handled by workspace CLIProxyAPI via WS.)
+**Fields** (`DesktopConfig`): `bridgeImage`, `bridgePorts`, `routerUrls` (array — multi-router support), `appUrl`, `composeDir` (optional — Docker Compose mode).
 
 ## Key Patterns
 
@@ -105,7 +105,7 @@ Priority: local file > router API > defaults.
 
 ## Security
 
-- **Secret mounting**: `ROUTER_SECRET` is written to a temp file (0600 perms) and bind-mounted into the container at `/run/secrets/router_secret` instead of passed as `-e` env var. This prevents exposure via `docker inspect`. The bridge `server.js` reads from the secret file with env var fallback.
+- **Bridge authentication**: Bridges provisioned via deep link use a per-bridge `BRIDGE_TOKEN` (from `POST /api/bridges`), not `ROUTER_SECRET`. The token is passed as `-e BRIDGE_TOKEN=...` env var. Legacy bridges using `ROUTER_SECRET` still work (server.js reads from `/run/secrets/router_secret` bind mount or env var fallback).
 - **GW_PASSWORD injection-safe**: `workspace-base/entrypoint.sh` passes `GW_PASSWORD` to the Node.js config-patch script via `process.env.GW_PASSWORD` (not shell string interpolation), preventing injection via a password containing shell metacharacters.
 - **503 on missing ROUTER_SECRET**: `bridge/server.js` returns HTTP 503 (not 500) when `ROUTER_SECRET` is empty/unset, making misconfiguration distinguishable from runtime errors. All secret comparisons in `server.js` use `safeCompare()` (timing-safe, based on `crypto.timingSafeEqual`).
 - **Exec allowlists**: Both `bridge/bridge.js` and `workspace-base/bridge.js` restrict commands to allowlisted prefixes (e.g. `docker`, `node`, `pm2`, `bash scripts/`). Shell metacharacters (`;`, backticks) are blocked to prevent injection.
@@ -123,17 +123,19 @@ Priority: local file > router API > defaults.
 
 **Deep link provisioning** (lib.rs → handle_provision):
 ```
-1. Validate JWT token from deep link params
-2. Fetch versioned bridge image tag from GET /api/config/desktop
-3. Check Docker → install if missing (platform-specific, elevated)
-4. Pull versioned bridge image + create container (with PAIRING_CODE)
-5. Wait for health (localhost:3100/health)
-6. Open browser (bridge redirects to /link?code=XXXX for pairing)
+1. Dedup check (5s cooldown for duplicate OS handler invocations)
+2. Build config from deep link params (router URL, app URL, optional image)
+3. Check Docker → error if not available (user must install)
+4. If bridge already running → check membership via router API → claim or reuse
+5. docker pull image + POST /api/bridges (gets bridgeId + bridgeToken)
+6. Claim bridge via API (auto-link to user before container starts)
+7. docker run bridge container with BRIDGE_ID + BRIDGE_TOKEN + ROUTER_URLS
+8. Open browser to pairing URL (or silent if claimed directly)
 ```
 
 ## Bridge Container
 
-Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-v<version>` (versioned tag — not `:latest`). The current version is fetched from `GET /api/config/desktop` at Tauri startup and used in all `docker run` commands.
+Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest` (default from `DesktopConfig`). Can be overridden via deep link `image` param or local config file. Tauri no longer fetches config from `GET /api/config/desktop` — bridge provisioning is driven entirely by deep link parameters.
 
 Runs two pm2 processes:
 - `pairing-server` (server.js) — health endpoint + pairing code redirect on port 3100. Registers bridge with router, writes auth credentials to `/data/auth.json`.
@@ -141,9 +143,9 @@ Runs two pm2 processes:
 
 Ports mapped: 3100 (pairing/health only). OAuth callback ports (54545, 8085, 1455) were removed — OAuth is now handled by the workspace CLIProxyAPI with callbacks delivered via WS (`cliproxy_oauth_callback`)
 
-Secret: `ROUTER_SECRET` mounted as `/run/secrets/router_secret` (read-only bind mount from host temp file). `server.js` reads secret file first, falls back to env var.
+Auth: Bridges created via Tauri deep link receive a per-bridge `BRIDGE_TOKEN` from `POST /api/bridges` (passed as env var). Legacy bridges (docker-compose dev) use `ROUTER_SECRET` mounted at `/run/secrets/router_secret`. `server.js` accepts either.
 
-**Auto-discovery flow**: When started with `PAIRING_CODE` env var, the bridge calls `POST /api/bridges/claim-device` to exchange the code (5-min TTL) for a unique `bridgeId` + `bridgeToken`. After connecting to the router WS, the router sends `scan_bridges`; the bridge scans Docker for sibling bridge containers and reports back. Router responds with `bridge_adopt` (join existing stack) or `bridge_primary` (recreate with mapped ports).
+**Auto-discovery flow**: When started with `BRIDGE_TOKEN` + `BRIDGE_ID` env vars (from Tauri deep link provisioning), the bridge authenticates directly with the router WS. Legacy flow: when started with `PAIRING_CODE` env var, the bridge calls `POST /api/bridges/claim-device` to exchange the code (5-min TTL) for a unique `bridgeId` + `bridgeToken`. After connecting to the router WS, the router sends `scan_bridges`; the bridge scans Docker for sibling bridge containers and reports back. Router responds with `bridge_adopt` (join existing stack) or `bridge_primary` (recreate with mapped ports).
 
 **OS detection**: Bridge queries Docker API `/info` at startup to detect host OS — `linuxkit` kernel → macOS, `WSL` in OS name → Windows, otherwise Linux. Reported to router on self-registration.
 

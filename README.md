@@ -7,8 +7,9 @@ Lightweight cross-platform system tray app that launches the xAI Workspace syste
 1. **Installs Docker** — Downloads and installs Docker Desktop (macOS/Windows) or Docker Engine (Linux) if not present
 2. **Runs the bridge** — Pulls and starts the bridge container from ECR with health monitoring
 3. **Device pairing** — Opens browser for zero-click account linking via pairing code
-4. **OAuth interception** — Listens on localhost callback ports (Claude, Gemini, Codex) and forwards to the router
-5. **System tray** — Sits quietly in the tray with per-provider OAuth port toggles
+4. **System tray** — Sits quietly in the tray
+
+OAuth for CLI model providers (Claude, Gemini, Codex) is handled by the workspace CLIProxyAPI mini-app — callbacks are delivered via WebSocket (`cliproxy_oauth_callback`), not via localhost ports on this app.
 
 ## Quick start
 
@@ -49,12 +50,7 @@ Place `xaiworkspace-config.json` next to the executable:
 ```json
 {
   "bridgeImage": "xaiworkspace-bridge:latest",
-  "bridgePorts": [3100, 54545, 8085, 1455],
-  "oauthProviders": [
-    { "name": "claude", "port": 54545 },
-    { "name": "gemini", "port": 8085 },
-    { "name": "codex", "port": 1455 }
-  ],
+  "bridgePorts": [3100],
   "routerUrl": "http://localhost:8080",
   "appUrl": "http://localhost:4200"
 }
@@ -66,7 +62,7 @@ Pre-made configs in `config/`:
 
 ### Router API config (production)
 
-In production (no local file), the app fetches config from `GET /api/config/desktop` on the router. This allows changing the bridge image, OAuth ports, or URLs without rebuilding the app.
+In production (no local file), the app fetches config from `GET /api/config/desktop` on the router. This allows changing the bridge image or URLs without rebuilding the app.
 
 ### Defaults
 
@@ -82,15 +78,13 @@ Tauri (system tray)          Bridge (Docker)           Router (brain)
 ──────────────────           ──────────────            ──────────────
 Install Docker (once)        Relay commands            Manages everything
 Run bridge container         Docker/pm2 pipe           Users, instances,
-Listen OAuth ports           Serve localhost:3100      pairing codes,
-Forward to router            (pairing redirect)        OAuth tokens
-Toggle ports on/off
-Single instance guard
+Single instance guard        Serve localhost:3100      pairing codes,
+                             (pairing redirect)        OAuth tokens
 ```
 
 - **Router** is the only smart component — manages users, instances, pairing codes
-- **System bridge** (`bridge/`) is a pipe — relays between router and Docker, handles OAuth callbacks, auto-updates
-- **Workspace agent** (`workspace-base/`) runs inside each workspace container — installs apps, executes commands
+- **System bridge** (`bridge/`) is a pipe — relays between router and Docker, auto-updates
+- **Workspace agent** (`workspace-base/`) runs inside each workspace container — installs apps, executes commands. OAuth for CLI model providers is handled here by the CLIProxyAPI mini-app, with callbacks delivered via WebSocket.
 - **Tauri** is a launcher — starts the system bridge Docker container, sits in tray
 
 ## System tray
@@ -100,15 +94,9 @@ Single instance guard
 │ Open xAI Workspace          │
 │ Bridge: checking...         │
 │ ─────────────────────────── │
-│ ✓ Claude (port 54545)       │  ← click to toggle
-│ ✓ Gemini (port 8085)        │
-│ ✓ Codex (port 1455)         │
-│ ─────────────────────────── │
 │ Quit                        │
 └─────────────────────────────┘
 ```
-
-OAuth ports are on by default. If the bridge container maps the same ports, Tauri silently skips them (bridge handles OAuth). Toggle off ports you don't need.
 
 ## Bridge Docker image
 
