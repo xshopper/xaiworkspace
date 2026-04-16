@@ -47,6 +47,16 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
     let last = LAST_PROVISION.load(std::sync::atomic::Ordering::SeqCst);
     if now.saturating_sub(last) < 5 {
         eprintln!("[provision] Already provisioning — ignoring duplicate deep link");
+        // Surface a user-visible message so a legitimate rapid re-provision
+        // is not silently swallowed — the frontend shows a toast/banner.
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        let _ = app.emit("setup-progress", serde_json::json!({
+            "step": "A recent provision is still in progress — please wait a few seconds and try again.",
+            "percent": 0
+        }));
         return;
     }
     LAST_PROVISION.store(now, std::sync::atomic::Ordering::SeqCst);
@@ -74,6 +84,20 @@ async fn handle_provision(app: AppHandle, params: ProvisionParams) {
         ..Default::default()
     };
     if let Some(image) = params.image {
+        // Validate the deep-link-supplied image against the allowlist before it
+        // reaches `docker pull` / `docker run`. An attacker-controlled image here
+        // would be host RCE because the bridge container is launched with the
+        // Docker socket mounted. Reject early, do not fall through.
+        if !is_allowed_image(&image) {
+            eprintln!("[provision] Rejected disallowed bridge image: {image}");
+            let _ = app.emit("setup-error", serde_json::json!({
+                "error": format!(
+                    "Refusing to provision bridge with disallowed image: {image}. \
+                     Only official xAI Workspace bridge images are permitted."
+                )
+            }));
+            return;
+        }
         cfg.bridge_image = image;
     }
 
@@ -145,6 +169,27 @@ fn is_allowed_url(url: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if a Docker image reference is an allowed xAI Workspace bridge image.
+///
+/// Only accepts the exact public ECR registry prefix with a semver bridge tag, to
+/// prevent a malicious deep link from causing `docker pull` / `docker run` of an
+/// arbitrary image (which would be a host RCE since the bridge container is
+/// launched with `-v /var/run/docker.sock:/var/run/docker.sock`).
+///
+/// Equivalent regex: ^public\.ecr\.aws/s3b3q6t2/xaiworkspace-docker:bridge-v\d+\.\d+\.\d+$
+fn is_allowed_image(image: &str) -> bool {
+    const PREFIX: &str = "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-v";
+    let Some(rest) = image.strip_prefix(PREFIX) else {
+        return false;
+    };
+    // rest must be exactly three dot-separated numeric components (semver MAJOR.MINOR.PATCH)
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parse deep link URL and extract provision parameters.
