@@ -19,13 +19,6 @@ ECR_REPO="public.ecr.aws/s3b3q6t2/xaiworkspace-docker"
 PLATFORMS="linux/amd64,linux/arm64"
 BUILDER_NAME="xaiw-bridge-builder"
 
-# Deprecation notice for the removed --skip-build flag
-if [[ "${1:-}" == "--skip-build" ]]; then
-  echo "NOTE: --skip-build is no longer supported. Multi-arch build + push is a single step." >&2
-  echo "      Continuing with full build and push." >&2
-fi
-
-# Read version from package.json
 VERSION=$(node -e "console.log(require('$REPO_DIR/bridge/package.json').version)")
 echo "Bridge version: $VERSION"
 
