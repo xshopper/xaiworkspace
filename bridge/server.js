@@ -60,10 +60,22 @@ const PAIRING_CODE = process.env.PAIRING_CODE || '';
 // Domain allowlist for adding new routers
 const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
 
-/** Validate a router URL against the domain allowlist. */
+// Loopback hostnames are exempt from the HTTPS requirement because traffic
+// never leaves the host and cannot be intercepted on the network path.
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+/**
+ * Validate a router URL against the domain allowlist and require HTTPS so that
+ * bridge tokens and `x-router-secret` headers are never sent in cleartext.
+ * Plain HTTP is permitted only for loopback hostnames (local development).
+ */
 function isAllowedRouterUrl(routerUrl) {
   try {
-    const { hostname } = new URL(routerUrl);
+    const { protocol, hostname } = new URL(routerUrl);
+    const isLoopback = LOOPBACK_HOSTNAMES.has(hostname);
+    if (protocol !== 'https:' && !(protocol === 'http:' && isLoopback)) {
+      return false;
+    }
     return ALLOWED_ROUTER_DOMAINS.some(d =>
       d.startsWith('.') ? hostname.endsWith(d) || hostname === d.slice(1) : hostname === d
     );

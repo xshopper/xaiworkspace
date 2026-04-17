@@ -71,9 +71,22 @@ function connectRouter(entry) {
     return;
   }
 
-  // Validate URL scheme
-  if (!/^https?:\/\//.test(routerUrl)) {
-    console.error(`[bridge] Invalid router URL (must start with http/https): ${routerUrl}`);
+  // Validate URL scheme. Require HTTPS (mapped to wss://) so the bridge token
+  // sent in the `gateway_auth` message cannot be captured on the network path.
+  // Plain HTTP is permitted only for loopback hostnames (local development).
+  let parsedRouterUrl;
+  try {
+    parsedRouterUrl = new URL(routerUrl);
+  } catch {
+    console.error(`[bridge] Invalid router URL: ${routerUrl}`);
+    return;
+  }
+  const isLoopback = parsedRouterUrl.hostname === 'localhost'
+    || parsedRouterUrl.hostname === '127.0.0.1'
+    || parsedRouterUrl.hostname === '::1';
+  if (parsedRouterUrl.protocol !== 'https:'
+    && !(parsedRouterUrl.protocol === 'http:' && isLoopback)) {
+    console.error(`[bridge] Refusing insecure router URL (HTTPS required for non-loopback hosts): ${routerUrl}`);
     return;
   }
 
