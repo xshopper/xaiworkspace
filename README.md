@@ -41,35 +41,30 @@ Output: `src-tauri/target/release/bundle/`
 
 ## Configuration
 
-Config is loaded with priority: **local file > router API > defaults**.
+Bridge provisioning is driven entirely by the deep link. The app starts with hardcoded defaults and overrides them with values from the `xaiworkspace://provision` URL when the user triggers pairing from the web app.
 
-### Local config file (dev/test)
+### Deep link parameters
 
-Place `xaiworkspace-config.json` next to the executable:
-
-```json
-{
-  "bridgeImage": "xaiworkspace-bridge:latest",
-  "bridgePorts": [3100],
-  "routerUrl": "http://localhost:8080",
-  "appUrl": "http://localhost:4200"
-}
+```
+xaiworkspace://provision?router=URL&app=URL&token=JWT&image=TAG
 ```
 
-Pre-made configs in `config/`:
-- `config/dev.json` — local development (localhost router + frontend)
-- `config/test.json` — test environment
+| Param | Overrides | Required |
+|-------|-----------|----------|
+| `router` | `routerUrls` (single entry) | yes |
+| `app` | `appUrl` | yes |
+| `token` | Per-bridge authentication token | yes |
+| `image` | `bridgeImage` (must match allowlist) | no |
 
-### Router API config (production)
-
-In production (no local file), the app fetches config from `GET /api/config/desktop` on the router. This allows changing the bridge image or URLs without rebuilding the app.
+The `image` parameter is validated against an allowlist before being passed to `docker pull` / `docker run`; unknown images are rejected.
 
 ### Defaults
 
-If both local file and router API fail, hardcoded defaults are used:
+When a deep link parameter is absent, these hardcoded values are used:
 - Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest`
 - Router: `https://router.xaiworkspace.com`
-- App: `https://app.xaiworkspace.com`
+- App: `https://xaiworkspace.com`
+- Bridge port: `3100`
 
 ## Architecture
 
