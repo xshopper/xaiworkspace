@@ -17,6 +17,43 @@ const NETWORK_NAME = process.env.COMPOSE_NETWORK || 'xai-dev';
 // Per-user compose stacks: Map<chatId, Map<instanceId, config>>
 const userStacks = new Map();
 
+/**
+ * Extract service names from a compose YAML string.
+ *
+ * Walks the file line-by-line and collects keys at exactly two-space indent
+ * inside the top-level `services:` block. Supports plain, double-quoted, and
+ * single-quoted keys so names containing metacharacters (`.`, `[`, `]`, etc.)
+ * are preserved. Stops when the next top-level key (e.g. `networks:`,
+ * `volumes:`) is reached.
+ */
+function parseServiceNames(content) {
+  const services = new Map();
+  const lines = content.split('\n');
+  let inServices = false;
+  for (const line of lines) {
+    // A top-level key ends the services block (or starts it if it's `services:`).
+    if (/^[^\s#]/.test(line)) {
+      if (/^services\s*:\s*$/.test(line)) {
+        inServices = true;
+        continue;
+      }
+      if (inServices) break;
+      continue;
+    }
+    if (!inServices) continue;
+    // Service-name lines have exactly two leading spaces and end with `:`.
+    // Accept plain, double-quoted, or single-quoted keys.
+    const match = line.match(/^  (?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^\s:"'#][^:]*?))\s*:\s*$/);
+    if (match) {
+      const name = match[1] !== undefined ? match[1]
+        : match[2] !== undefined ? match[2]
+        : match[3];
+      services.set(name, {});
+    }
+  }
+  return services;
+}
+
 /** Restore userStacks from existing compose files on disk after bridge restart. */
 function init() {
   try {
@@ -25,11 +62,10 @@ function init() {
       const content = fs.readFileSync(path.join(COMPOSE_DIR, file), 'utf8');
       // Parse the chat ID from the filename: docker-compose-{chatId}.yml
       const chatId = file.replace('docker-compose-', '').replace('.yml', '');
-      // Parse instance names from the YAML services section only (exclude networks/volumes)
-      const services = new Map();
-      const servicesSection = content.split(/^networks:/m)[0] || content;
-      const matches = servicesSection.matchAll(/^  ([a-zA-Z0-9_-]+):\n/gm);
-      for (const m of matches) services.set(m[1], {});
+      // Parse service names from the YAML services block. Walk lines instead of
+      // using a single regex so names containing metacharacters (dots, brackets,
+      // quoted keys) are handled without skipping or splitting incorrectly.
+      const services = parseServiceNames(content);
       if (services.size > 0) userStacks.set(chatId, services);
     }
     if (userStacks.size > 0) console.log(`[compose] Restored ${userStacks.size} stacks from disk`);
