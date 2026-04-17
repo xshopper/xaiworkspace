@@ -338,7 +338,7 @@ function handleMessage(msg, conn, routerUrl) {
         if (!err && stdout) {
           try {
             const pm2List = JSON.parse(stdout.trim());
-            if (pm2List.length > 0) {
+            if (Array.isArray(pm2List) && pm2List.length > 0) {
               result[inst.name] = pm2List.map(p => ({
                 name: p.name,
                 status: p.pm2_env?.status || 'unknown',
