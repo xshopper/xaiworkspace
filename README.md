@@ -69,7 +69,7 @@ In production (no local file), the app fetches config from `GET /api/config/desk
 If both local file and router API fail, hardcoded defaults are used:
 - Image: `public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest`
 - Router: `https://router.xaiworkspace.com`
-- App: `https://app.xaiworkspace.com`
+- App: `https://xaiworkspace.com`
 
 ## Architecture
 
