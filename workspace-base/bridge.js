@@ -57,6 +57,7 @@ const AGENT_VERSION = '1.1.0';
 const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
 const VALID_ENV_KEY = /^[A-Z_][A-Z0-9_]*$/;
+const MAX_ENV_VALUE_LENGTH = 4096; // 4KB — prevents memory/disk exhaustion via oversized env values
 
 if (!INSTANCE_ID || !INSTANCE_TOKEN) {
   console.error('[workspace-agent] INSTANCE_ID and INSTANCE_TOKEN are required');
@@ -569,6 +570,10 @@ async function handleInstallApp(msg) {
         }
         // Sanitize value: strip newlines and shell metacharacters that could escape the env file
         const sanitized = String(v).replace(/[\n\r`$\\;|&"']/g, '');
+        if (sanitized.length > MAX_ENV_VALUE_LENGTH) {
+          console.warn(`[workspace-agent] Skipping env var ${k}: value exceeds ${MAX_ENV_VALUE_LENGTH} bytes`);
+          continue;
+        }
         if (!new RegExp('^' + k + '=', 'm').test(existing)) {
           fs.appendFileSync(secretsPath, `${k}=${sanitized}\n`);
           addedKeys.push(k);
