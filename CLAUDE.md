@@ -55,7 +55,7 @@ The script:
 | Component | Role | Code |
 |-----------|------|------|
 | `config.rs` | Load config: local file > router API > defaults | `DesktopConfig` struct |
-| `docker.rs` | Detect/install Docker Desktop per platform | `is_available()`, `install()` |
+| `docker.rs` | Detect Docker daemon availability (install is user's responsibility) | `is_available()` |
 | `bridge.rs` | Pull image, create/start container, health check, mount secrets | `run()`, `wait_for_health()` |
 | `tray.rs` | System tray menu (quit) | Minimal tray |
 | `lib.rs` | Setup flow orchestration, deep link provisioning, single instance guard | `run_setup()`, `handle_provision()` |
