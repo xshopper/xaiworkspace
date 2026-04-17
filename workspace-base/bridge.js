@@ -979,25 +979,32 @@ function handleExec(msg) {
   child.stdout.on('data', d => { stdout += d; });
   child.stderr.on('data', d => { stderr += d; });
 
+  let execTimeout;
+  let timedOut = false;
   let resultSent = false;
-  child.on('close', code => {
+
+  const sendResult = (code, extraStderr = '') => {
     if (resultSent) return;
     resultSent = true;
     clearTimeout(execTimeout);
-    send({ type: 'exec_result', id, code, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) });
+    send({ type: 'exec_result', id, code, stdout: stdout.slice(-8192), stderr: (stderr + extraStderr).slice(-8192) });
+  };
+
+  child.on('close', code => {
+    if (timedOut) return;
+    sendResult(code);
   });
 
   // Timeout: kill process group after 5 minutes (negative PID kills entire group)
-  const execTimeout = setTimeout(() => {
-    if (resultSent) return;
-    resultSent = true;
+  execTimeout = setTimeout(() => {
+    timedOut = true;
     // Guard against pid 0/undefined which would kill the bridge's own process group
     if (child.pid > 0) {
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     } else {
       try { child.kill('SIGKILL'); } catch {}
     }
-    send({ type: 'exec_result', id, code: -1, stdout: stdout.slice(-8192), stderr: stderr.slice(-8192) + '\nTimeout (300s)' });
+    sendResult(-1, '\nTimeout (300s)');
   }, 300_000);
 }
 
