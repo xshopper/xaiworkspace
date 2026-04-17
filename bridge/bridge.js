@@ -371,7 +371,7 @@ const updateProgressInterval = setInterval(() => {
 // ── Provision: create a workspace container via Docker ────────────────────
 
 const ENV_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const ENV_VAL_FORBIDDEN_RE = /[\x00-\x08\x0e-\x1f\x7f]/;
+const ENV_VAL_FORBIDDEN_RE = /[\x00-\x1f\x7f]/;
 
 function handleProvision(msg, ws) {
   const { instanceId, image, env } = msg;
