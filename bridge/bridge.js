@@ -401,6 +401,23 @@ const updateProgressInterval = setInterval(() => {
 const ENV_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const ENV_VAL_FORBIDDEN_RE = /[\x00-\x1f\x7f]/;
 
+// Allowlisted image registry prefix for workspace containers. Prevents a
+// compromised router from provisioning an arbitrary image (host RCE risk,
+// since this container runs with access to the Docker socket).
+//
+// Equivalent regex: ^public\.ecr\.aws/s3b3q6t2/xaiworkspace-docker:[a-zA-Z0-9_.-]+$
+// Override via ALLOWED_WORKSPACE_IMAGE_PREFIX env var for dev/test registries.
+const DEFAULT_ALLOWED_IMAGE_PREFIX = 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:';
+const ALLOWED_IMAGE_PREFIX = process.env.ALLOWED_WORKSPACE_IMAGE_PREFIX || DEFAULT_ALLOWED_IMAGE_PREFIX;
+const IMAGE_TAG_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/;
+
+function isAllowedWorkspaceImage(image) {
+  if (typeof image !== 'string' || image.length === 0 || image.length > 512) return false;
+  if (!image.startsWith(ALLOWED_IMAGE_PREFIX)) return false;
+  const tag = image.slice(ALLOWED_IMAGE_PREFIX.length);
+  return IMAGE_TAG_RE.test(tag);
+}
+
 function handleProvision(msg, ws) {
   const { instanceId, image, env } = msg;
 
@@ -412,11 +429,11 @@ function handleProvision(msg, ws) {
     return;
   }
 
-  const safeImage = image || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest';
-  if (!/^[a-zA-Z0-9_./:@-]+$/.test(safeImage)) {
-    console.warn(`[bridge] Provision rejected: invalid image name: ${safeImage}`);
+  const safeImage = image || `${ALLOWED_IMAGE_PREFIX}latest`;
+  if (!isAllowedWorkspaceImage(safeImage)) {
+    console.warn(`[bridge] Provision rejected: image not in allowlist: ${safeImage}`);
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Invalid image name' }));
+      ws.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Image not in allowlist' }));
     }
     return;
   }
