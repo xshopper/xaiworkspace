@@ -414,13 +414,35 @@ function printStatus(routers) {
 
 // ── Parse JSON body ──────────────────────────────────────────────────────
 
-function parseBody(req) {
+// Cap request body size to prevent OOM via unbounded accumulation.
+// All current endpoints accept small JSON payloads (router URL, instance descriptor).
+const MAX_BODY_BYTES = 64 * 1024;
+
+function parseBody(req, res, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve) => {
-    let data = '';
-    req.on('data', chunk => data += chunk);
-    req.on('end', () => {
-      try { resolve(JSON.parse(data)); } catch { resolve({}); }
+    const chunks = [];
+    let size = 0;
+    let aborted = false;
+    req.on('data', chunk => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        aborted = true;
+        if (res && !res.headersSent) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Payload too large' }));
+        }
+        req.destroy();
+        resolve(null);
+      } else {
+        chunks.push(chunk);
+      }
     });
+    req.on('end', () => {
+      if (aborted) return;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { resolve({}); }
+    });
+    req.on('error', () => { if (!aborted) resolve({}); });
   });
 }
 
@@ -533,7 +555,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
-    const body = await parseBody(req);
+    const body = await parseBody(req, res);
+    if (body === null) return;
     const { routerUrl } = body;
 
     if (!routerUrl || typeof routerUrl !== 'string') {
@@ -582,7 +605,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const body = await parseBody(req);
+    const body = await parseBody(req, res);
+    if (body === null) return;
     const { routerUrl } = body;
 
     if (!routerUrl) {
@@ -624,7 +648,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
-    const body = await parseBody(req);
+    const body = await parseBody(req, res);
+    if (body === null) return;
     if (!body.instanceId) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing instanceId' }));
