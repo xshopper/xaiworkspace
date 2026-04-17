@@ -82,6 +82,54 @@ function isAllowedRouterUrl(routerUrl) {
   } catch { return false; }
 }
 
+/**
+ * Validate a docker-compose short-syntax volume string.
+ *
+ * Rejects host bind mounts (source paths starting with "/", "./", "../", or "~")
+ * to prevent a compromised router from mounting arbitrary host paths into a
+ * workspace container. Only named volumes and anonymous container-path-only
+ * entries are permitted.
+ *
+ * Accepted shapes:
+ *   - "target"                        (anonymous volume; absolute target, no "..")
+ *   - "name:target[:mode]"            (named volume; name is a docker identifier)
+ *
+ * Returns { ok: true } or { ok: false, reason: string }.
+ */
+function validateVolumeSpec(v) {
+  if (typeof v !== 'string') return { ok: false, reason: 'volume must be a string' };
+  if (v.length === 0 || v.length > 512) return { ok: false, reason: 'volume length out of range' };
+  // Disallow control chars and shell/YAML hazards beyond the escaping layer.
+  if (/[\x00-\x1f\x7f]/.test(v)) return { ok: false, reason: 'volume contains control characters' };
+
+  const parts = v.split(':');
+  if (parts.length > 3) return { ok: false, reason: 'too many ":" separators' };
+
+  if (parts.length === 1) {
+    // Anonymous volume — container path only.
+    const target = parts[0];
+    if (!target.startsWith('/')) return { ok: false, reason: 'target path must be absolute' };
+    if (target.split('/').includes('..')) return { ok: false, reason: 'target path must not contain ".."' };
+    return { ok: true };
+  }
+
+  const [source, target, mode] = parts;
+  // Reject any host path pattern outright.
+  if (source.startsWith('/') || source.startsWith('.') || source.startsWith('~')) {
+    return { ok: false, reason: 'host bind mounts are not permitted' };
+  }
+  // Named volume identifiers: docker requires [a-zA-Z0-9][a-zA-Z0-9_.-]*.
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(source)) {
+    return { ok: false, reason: 'invalid named volume identifier' };
+  }
+  if (!target || !target.startsWith('/')) return { ok: false, reason: 'target path must be absolute' };
+  if (target.split('/').includes('..')) return { ok: false, reason: 'target path must not contain ".."' };
+  if (mode !== undefined && !/^[a-z,]+$/i.test(mode)) {
+    return { ok: false, reason: 'invalid mount mode' };
+  }
+  return { ok: true };
+}
+
 /** Detect host OS via Docker API (container always reports linux). */
 async function detectHostOs() {
   try {
@@ -643,12 +691,21 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Missing instanceId' }));
       return;
     }
+    const volumes = Array.isArray(body.volumes) ? body.volumes : [];
+    for (const v of volumes) {
+      const check = validateVolumeSpec(v);
+      if (!check.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Invalid volume: ${check.reason}` }));
+        return;
+      }
+    }
     try {
       compose.addInstance(body.instanceId, {
         image: body.image,
         env: body.env || {},
         ports: body.ports || [],
-        volumes: body.volumes || [],
+        volumes,
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, instanceId: body.instanceId }));
