@@ -58,6 +58,11 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
 const VALID_ENV_KEY = /^[A-Z_][A-Z0-9_]*$/;
 
+// Escape regex metacharacters so arbitrary strings can be used in RegExp literals safely.
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 if (!INSTANCE_ID || !INSTANCE_TOKEN) {
   console.error('[workspace-agent] INSTANCE_ID and INSTANCE_TOKEN are required');
   process.exit(1);
@@ -569,7 +574,7 @@ async function handleInstallApp(msg) {
         }
         // Sanitize value: strip newlines and shell metacharacters that could escape the env file
         const sanitized = String(v).replace(/[\n\r`$\\;|&"']/g, '');
-        if (!new RegExp('^' + k + '=', 'm').test(existing)) {
+        if (!new RegExp('^' + escapeRegex(k) + '=', 'm').test(existing)) {
           fs.appendFileSync(secretsPath, `${k}=${sanitized}\n`);
           addedKeys.push(k);
         }
@@ -743,7 +748,7 @@ async function handleInstallApp(msg) {
       try {
         let secrets = fs.readFileSync(SECRETS_FILE, 'utf8');
         for (const k of addedKeys) {
-          secrets = secrets.replace(new RegExp('^' + k + '=.*\\n?', 'mg'), '');
+          secrets = secrets.replace(new RegExp('^' + escapeRegex(k) + '=.*\\n?', 'mg'), '');
           delete process.env[k];
         }
         fs.writeFileSync(SECRETS_FILE, secrets);
@@ -811,7 +816,7 @@ function handleUninstallApp(msg) {
               console.warn(`[workspace-agent] Skipping unsafe key in .env-keys: ${key}`);
               continue;
             }
-            secrets = secrets.replace(new RegExp(`^${key}=.*\\n?`, 'mg'), '');
+            secrets = secrets.replace(new RegExp(`^${escapeRegex(key)}=.*\\n?`, 'mg'), '');
             delete process.env[key];
           }
           fs.writeFileSync(secretsPath, secrets);
