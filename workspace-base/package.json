@@ -2,6 +2,9 @@
   "name": "xaiworkspace-workspace-agent",
   "version": "1.0.0",
   "private": true,
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
   "dependencies": {
     "ws": "^8.18.0"
   }

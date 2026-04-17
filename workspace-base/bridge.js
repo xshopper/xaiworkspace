@@ -17,6 +17,17 @@ const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
+const {
+  deriveUsername,
+  isUrlTrusted,
+  isUrlShellSafe,
+  isSubdirSafe,
+  SAFE_SLUG,
+  SAFE_IDENTIFIER,
+  VALID_ENV_KEY,
+  isCommandAllowed,
+  hasDisallowedExecChars,
+} = require('./lib');
 
 // Load secrets from env file
 const SECRETS_FILE = '/etc/xai/secrets.env';
@@ -35,13 +46,8 @@ const PORT = process.env.PORT || '19001';
 const HEALTH_PORT = parseInt(process.env.BRIDGE_HEALTH_PORT || '19099', 10);
 
 // ── Per-user isolation ─────────────────────────────────────────────────────
-// Derive a Linux username from CHAT_ID. User apps run under this user via
-// su - (no sudo). The workspace-agent itself stays running as root.
-function deriveUsername(chatId) {
-  const sanitized = String(chatId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 28);
-  return `xai${sanitized || 'default'}`.toLowerCase();
-}
-
+// Derive a Linux username from CHAT_ID (see lib.js). User apps run under this
+// user via su - (no sudo). The workspace-agent itself stays running as root.
 const WS_USER = process.env.WS_USER || deriveUsername(CHAT_ID);
 const WS_HOME = `/home/${WS_USER}`;
 const HOME = process.env.HOME || WS_HOME;
@@ -52,11 +58,6 @@ process.env.PM2_HOME = process.env.PM2_HOME || `${WS_HOME}/.pm2`;
 
 // ── Agent version (reported to router; router can trigger self-update) ─────
 const AGENT_VERSION = '1.1.0';
-
-// ── Input validation patterns ──────────────────────────────────────────────
-const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
-const SAFE_IDENTIFIER = /^[a-zA-Z0-9._-]+$/;
-const VALID_ENV_KEY = /^[A-Z_][A-Z0-9_]*$/;
 
 if (!INSTANCE_ID || !INSTANCE_TOKEN) {
   console.error('[workspace-agent] INSTANCE_ID and INSTANCE_TOKEN are required');
@@ -206,47 +207,6 @@ function send(msg) {
 
 function sendProgress(id, slug, stage, percent, name = null) {
   send({ type: 'install_progress', id, slug, name: name || 'default', stage, percent });
-}
-
-// ── URL validation for app installs ─────────────────────────────────────────
-// Only download artifacts and clone source from trusted domains to prevent
-// a compromised router from directing the workspace to fetch malicious payloads.
-const TRUSTED_DOMAINS = new Set([
-  'github.com',
-  'api.github.com',
-  'codeload.github.com',
-  'raw.githubusercontent.com',
-  'registry.npmjs.org',
-  'xaiworkspace.com',
-  'router.xaiworkspace.com',
-]);
-
-function isUrlTrusted(url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'https:') return false;
-    return TRUSTED_DOMAINS.has(parsed.hostname)
-      || [...TRUSTED_DOMAINS].some(d => parsed.hostname.endsWith('.' + d));
-  } catch {
-    return false;
-  }
-}
-
-// Reject URLs whose path/query contains shell metacharacters that could escape
-// the double-quoted shell arguments used in curl/git execAsync calls.
-const SHELL_UNSAFE = /[$`"()|;&\n\r\\]/;
-function isUrlShellSafe(url) {
-  try {
-    const parsed = new URL(url);
-    return !SHELL_UNSAFE.test(parsed.pathname + parsed.search + parsed.hash);
-  } catch { return false; }
-}
-
-// Validate subdir: must be a relative path with no shell metacharacters.
-// Allows letters, digits, hyphens, underscores, dots, and forward slashes only.
-const SAFE_SUBDIR = /^[a-zA-Z0-9._\-/]+$/;
-function isSubdirSafe(s) {
-  return typeof s === 'string' && SAFE_SUBDIR.test(s) && !s.includes('..');
 }
 
 // ── Backup / restore helpers ────────────────────────────────────────────────
@@ -902,36 +862,6 @@ function handleListApps(msg) {
 // ── exec ────────────────────────────────────────────────────────────────────
 const MAX_COMMAND_LENGTH = 10240; // 10KB
 
-// Allowlisted command prefixes — only these commands can be executed via the router.
-// The workspace container runs user workloads, so this limits what the router can invoke.
-const EXEC_ALLOWLIST = [
-  'node ',
-  'pm2 ',
-  'bash scripts/',
-  'bash ./scripts/',
-  'cat ',
-  'ls ',
-  'echo ',
-  'whoami',
-  'hostname',
-  'uname ',
-  'df ',
-  'free ',
-  'ps ',
-  'npm ',
-  'npx ',
-  'curl ',
-  'tail ',
-  'head ',
-  'grep ',
-  'wc ',
-];
-
-function isCommandAllowed(command) {
-  const trimmed = command.trimStart();
-  return EXEC_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
-}
-
 function handleExec(msg) {
   const { id, command, cwd, user } = msg;
   if (!command || typeof command !== 'string' || command.length > MAX_COMMAND_LENGTH) {
@@ -949,7 +879,7 @@ function handleExec(msg) {
   // Block the most dangerous shell metacharacters (command chaining and backtick substitution).
   // $(), |, >, < are allowed because the router legitimately uses them in exec commands.
   // The allowlist above is the primary security layer.
-  if (/[;`]/.test(command)) {
+  if (hasDisallowedExecChars(command)) {
     console.warn(`[workspace-agent] exec rejected: disallowed shell characters`);
     send({ type: 'exec_result', id, code: -1, stdout: '', stderr: 'Command rejected: disallowed characters' });
     return;

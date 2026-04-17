@@ -1,1 +1,11 @@
-{"name":"xaiworkspace-bridge","version":"0.21.1","private":true,"dependencies":{"ws":"^8.18.0"}}
+{
+  "name": "xaiworkspace-bridge",
+  "version": "0.21.1",
+  "private": true,
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -15,17 +15,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const compose = require('./compose-manager');
+const { safeCompare, isAllowedRouterUrl, esc } = require('./lib');
 
 const ROUTERS_FILE = '/data/routers.json';
-
-/** Timing-safe secret comparison to prevent timing side-channel attacks. */
-function safeCompare(a, b) {
-  if (!a || !b) return false;
-  const bufA = Buffer.from(String(a));
-  const bufB = Buffer.from(String(b));
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
 
 // ROUTER_URLS: comma-separated list of router base URLs
 const ROUTER_URLS_RAW = process.env.ROUTER_URLS || process.env.ROUTER_URL || '';
@@ -56,19 +48,6 @@ const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10);
 // flow. When set, the bridge claims credentials via /api/bridges/claim-device
 // instead of /api/bridges/register (which requires ROUTER_SECRET).
 const PAIRING_CODE = process.env.PAIRING_CODE || '';
-
-// Domain allowlist for adding new routers
-const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
-
-/** Validate a router URL against the domain allowlist. */
-function isAllowedRouterUrl(routerUrl) {
-  try {
-    const { hostname } = new URL(routerUrl);
-    return ALLOWED_ROUTER_DOMAINS.some(d =>
-      d.startsWith('.') ? hostname.endsWith(d) || hostname === d.slice(1) : hostname === d
-    );
-  } catch { return false; }
-}
 
 /** Detect host OS via Docker API (container always reports linux). */
 async function detectHostOs() {
@@ -425,11 +404,6 @@ function parseBody(req) {
 }
 
 // ── Router management web UI HTML ────────────────────────────────────────
-
-/** Escape HTML to prevent XSS from router-supplied values. */
-function esc(str) {
-  return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
 
 function routerManagementPage() {
   const routers = loadRouters();

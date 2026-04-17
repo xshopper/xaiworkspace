@@ -8,6 +8,12 @@
 // ──────────────────────────────────────────────────────────────────────────
 const WebSocket = require('ws');
 const fs = require('fs');
+const {
+  isCommandAllowed,
+  hasDisallowedExecChars,
+  ENV_KEY_RE,
+  ENV_VAL_FORBIDDEN_RE,
+} = require('./lib');
 
 const ROUTERS_FILE = '/data/routers.json';
 
@@ -370,9 +376,6 @@ const updateProgressInterval = setInterval(() => {
 
 // ── Provision: create a workspace container via Docker ────────────────────
 
-const ENV_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const ENV_VAL_FORBIDDEN_RE = /[\x00-\x08\x0e-\x1f\x7f]/;
-
 function handleProvision(msg, ws) {
   const { instanceId, image, env } = msg;
 
@@ -449,17 +452,6 @@ function handleProvision(msg, ws) {
 // ── Exec: run commands locally, stream output back to router ──────────────
 const MAX_COMMAND_LENGTH = 10240;
 
-const EXEC_ALLOWLIST = [
-  'docker ', 'docker-compose ', 'docker compose ', 'pm2 ',
-  'curl ', 'cat /data/', 'ls ', 'echo ',
-  'whoami', 'hostname', 'uname ', 'df ', 'free ', 'ps ',
-];
-
-function isCommandAllowed(command) {
-  const trimmed = command.trimStart();
-  return EXEC_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
-}
-
 function handleExec(msg, ws) {
   const { id, command, cwd, user } = msg;
   const { spawn } = require('child_process');
@@ -482,7 +474,7 @@ function handleExec(msg, ws) {
   }
 
   // Block shell metacharacters + newlines that enable command injection
-  if (/[;`|$()><&\n\r]/.test(command)) {
+  if (hasDisallowedExecChars(command)) {
     console.warn(`[bridge] exec rejected: disallowed characters: ${command.slice(0, 80)}`);
     sendResult(-1, '', 'Command rejected: disallowed characters');
     return;
