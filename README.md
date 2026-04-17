@@ -51,7 +51,7 @@ Place `xaiworkspace-config.json` next to the executable:
 {
   "bridgeImage": "xaiworkspace-bridge:latest",
   "bridgePorts": [3100],
-  "routerUrl": "http://localhost:8080",
+  "routerUrls": ["http://localhost:8080"],
   "appUrl": "http://localhost:4200"
 }
 ```

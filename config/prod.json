@@ -1,6 +1,6 @@
 {
   "bridgeImage": "public.ecr.aws/s3b3q6t2/xaiworkspace-docker:bridge-latest",
   "bridgePorts": [3100],
-  "routerUrl": "https://router.xaiworkspace.com",
+  "routerUrls": ["https://router.xaiworkspace.com"],
   "appUrl": "https://xaiworkspace.com"
 }
