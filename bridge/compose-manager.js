@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { isAllowedImage } = require('./image-allowlist');
 
 const COMPOSE_DIR = process.env.COMPOSE_DIR || '/data';
 const WORKSPACE_IMAGE = process.env.WORKSPACE_IMAGE || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest';
@@ -126,9 +127,16 @@ function composeUp(chatId) {
 
 function addInstance(instanceId, config = {}) {
   const chatId = config.env?.CHAT_ID || 'default';
+  const image = config.image || WORKSPACE_IMAGE;
+  // Enforce registry allowlist on caller-supplied image. Callers (router over
+  // POST /api/instances) are authenticated but still untrusted at the host-RCE
+  // boundary — the bridge has the Docker socket mounted.
+  if (!isAllowedImage(image)) {
+    throw new Error(`Image not in allowlist: ${image}`);
+  }
   const services = getUserServices(chatId);
   services.set(instanceId, {
-    image: config.image || WORKSPACE_IMAGE,
+    image,
     env: config.env || {},
     ports: config.ports || [],
     volumes: config.volumes || [],

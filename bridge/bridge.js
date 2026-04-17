@@ -8,6 +8,7 @@
 // ──────────────────────────────────────────────────────────────────────────
 const WebSocket = require('ws');
 const fs = require('fs');
+const { isAllowedImage } = require('./image-allowlist');
 
 const ROUTERS_FILE = '/data/routers.json';
 
@@ -385,10 +386,13 @@ function handleProvision(msg, ws) {
   }
 
   const safeImage = image || 'public.ecr.aws/s3b3q6t2/xaiworkspace-docker:latest';
-  if (!/^[a-zA-Z0-9_./:@-]+$/.test(safeImage)) {
-    console.warn(`[bridge] Provision rejected: invalid image name: ${safeImage}`);
+  // Enforce registry allowlist: only images from the official xAI Workspace ECR
+  // repo may be pulled/run. Without this, a compromised or malicious router
+  // could make the bridge host pull and execute an arbitrary image.
+  if (!isAllowedImage(safeImage)) {
+    console.warn(`[bridge] Provision rejected: image not in allowlist: ${safeImage}`);
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Invalid image name' }));
+      ws.send(JSON.stringify({ type: 'provision_result', instanceId, status: 'failed', error: 'Image not in allowlist' }));
     }
     return;
   }
