@@ -197,7 +197,7 @@ async fn claim_bridge(router_url: &str, token: &str, code: &str) -> Result<(), S
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")
-        .body(format!(r#"{{"code":"{code}"}}"#))
+        .body(serde_json::json!({ "code": code }).to_string())
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
