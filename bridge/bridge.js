@@ -250,14 +250,29 @@ function handleMessage(msg, conn, routerUrl) {
     const orphanId = msg.instanceId;
     if (!/^[a-zA-Z0-9_-]+$/.test(orphanId)) return;
     const { execFile } = require('child_process');
-    execFile('docker', ['inspect', '--format', '{{.State.Running}}', orphanId], { timeout: 5000 }, (err) => {
-      if (err) return;
-      console.log(`[bridge] Stopping orphaned instance: ${orphanId}`);
-      execFile('docker', ['stop', '-t', '5', orphanId], { timeout: 15000 }, () => {
+    execFile('docker', ['inspect', '--format', '{{.State.Running}}', orphanId], { timeout: 5000 }, (err, stdout) => {
+      if (err) {
+        console.warn(`[bridge] Failed to inspect orphan ${orphanId}: ${err.message}`);
+        return;
+      }
+      const isRunning = stdout.trim() === 'true';
+      const removeOrphan = () => {
         execFile('docker', ['rm', orphanId], { timeout: 10000 }, (rmErr) => {
           if (rmErr) console.warn(`[bridge] Failed to remove orphan ${orphanId}: ${rmErr.message}`);
           else console.log(`[bridge] Removed orphaned instance: ${orphanId}`);
         });
+      };
+      if (!isRunning) {
+        removeOrphan();
+        return;
+      }
+      console.log(`[bridge] Stopping orphaned instance: ${orphanId}`);
+      execFile('docker', ['stop', '-t', '5', orphanId], { timeout: 15000 }, (stopErr) => {
+        if (stopErr) {
+          console.warn(`[bridge] Failed to stop orphan ${orphanId}: ${stopErr.message}`);
+          return;
+        }
+        removeOrphan();
       });
     });
     return;
