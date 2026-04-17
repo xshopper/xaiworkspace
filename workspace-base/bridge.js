@@ -718,10 +718,23 @@ async function handleInstallApp(msg) {
         // Default instance with existing ecosystem file — use it as-is
         await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
       } else if (manifest?.startup) {
-        // Generate instance-specific ecosystem config
+        // Generate instance-specific ecosystem config.
+        // Build the config as a plain object and serialize the whole thing with
+        // JSON.stringify to avoid any chance of template/string-concat injection
+        // via user-controlled fields (processName, startupCmd, appDir, instanceEnv).
         const startupCmd = manifest.startup;
         const instanceEcoFile = instName === 'default' ? ecoFile : path.join(appDir, `ecosystem.${instName}.config.js`);
-        const eco = 'module.exports = { apps: [{ name: ' + JSON.stringify(processName) + ', script: "/bin/bash", args: ["-c", ' + JSON.stringify(startupCmd) + '], cwd: ' + JSON.stringify(appDir) + ', autorestart: true, env: ' + JSON.stringify(instanceEnv) + ' }] };';
+        const ecoConfig = {
+          apps: [{
+            name: processName,
+            script: '/bin/bash',
+            args: ['-c', startupCmd],
+            cwd: appDir,
+            autorestart: true,
+            env: instanceEnv,
+          }],
+        };
+        const eco = `module.exports = ${JSON.stringify(ecoConfig, null, 2)};\n`;
         fs.writeFileSync(instanceEcoFile, eco);
         await execAsync(`pm2 startOrRestart "${instanceEcoFile}" --update-env`, { timeout: 30000 });
         console.log(`[workspace-agent] Started ${processName} from manifest.startup`);
