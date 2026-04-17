@@ -28,7 +28,7 @@ async fn run_setup(app: AppHandle) {
     }
 }
 
-/// Timestamp of last provision start — dedup window of 30 seconds.
+/// Timestamp of last provision start — dedup window of 5 seconds.
 static LAST_PROVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Handle deep link: xaiworkspace://provision?router=URL&app=URL&token=JWT
