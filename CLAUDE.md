@@ -76,11 +76,11 @@ bridge/
   server.js        # Pairing server (health + redirect) — runs inside Docker
   bridge.js        # WS bridge (router ↔ gateway) — runs inside Docker
   ecosystem.config.js  # pm2 config for both processes
+  compose-manager.js  # Docker Compose management for workspace containers
+  updater.js       # Auto-updater: polls ECR for new bridge image every 30 minutes
 workspace-base/
   bridge.js        # Bootstrap bridge for bare workspace containers (install/exec/uninstall)
   entrypoint.sh    # Container entrypoint: writes secrets.env, starts workspace agent
-bridge/
-  compose-manager.js  # Docker Compose management for workspace containers
 config/
   dev.json         # Local dev config (localhost)
   test.json        # Test environment config
