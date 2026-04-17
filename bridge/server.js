@@ -373,16 +373,17 @@ async function registerAllRouters() {
   const verb = PAIRING_CODE ? 'Claiming with' : 'Registering with';
   console.log(`[pairing] ${verb} ${toRegister.length} new router(s) concurrently...`);
 
+  // Retry indefinitely with exponential backoff capped at 5 minutes. The bridge
+  // must self-heal when the router is temporarily unavailable (e.g. rolling
+  // deploy) without requiring a manual container restart.
   async function registerWithRetries(routerUrl) {
-    for (let attempt = 1; attempt <= 10; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       const result = await acquire(routerUrl);
       if (result) return result;
-      const delay = Math.min(5000 * attempt, 30000);
-      console.log(`[pairing] Retry ${attempt}/10 for ${routerUrl} in ${delay / 1000}s`);
+      const delay = Math.min(5000 * attempt, 300000);
+      console.log(`[pairing] Retry ${attempt} for ${routerUrl} in ${delay / 1000}s`);
       await new Promise(r => setTimeout(r, delay));
     }
-    console.error(`[pairing] Failed to ${PAIRING_CODE ? 'claim' : 'register'} with ${routerUrl} after 10 attempts`);
-    return null;
   }
 
   const results = await Promise.allSettled(toRegister.map(url => registerWithRetries(url)));
