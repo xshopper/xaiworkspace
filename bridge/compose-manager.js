@@ -124,7 +124,12 @@ function composeUp(chatId) {
   }
 }
 
+const INSTANCE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
 function addInstance(instanceId, config = {}) {
+  if (typeof instanceId !== 'string' || !INSTANCE_ID_PATTERN.test(instanceId)) {
+    throw new Error('Invalid instanceId: must match /^[a-zA-Z0-9_-]+$/');
+  }
   const chatId = config.env?.CHAT_ID || 'default';
   const services = getUserServices(chatId);
   services.set(instanceId, {

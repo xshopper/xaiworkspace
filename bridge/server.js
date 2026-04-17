@@ -630,6 +630,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Missing instanceId' }));
       return;
     }
+    if (typeof body.instanceId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(body.instanceId)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid instanceId' }));
+      return;
+    }
     try {
       compose.addInstance(body.instanceId, {
         image: body.image,
