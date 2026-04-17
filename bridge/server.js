@@ -57,8 +57,13 @@ const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL || '30000', 10);
 // instead of /api/bridges/register (which requires ROUTER_SECRET).
 const PAIRING_CODE = process.env.PAIRING_CODE || '';
 
-// Domain allowlist for adding new routers
-const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com', 'localhost'];
+// Domain allowlist for adding new routers via the /api/routers API.
+// Note: 'localhost' is intentionally excluded here. Allowing it in combination
+// with any unauthenticated code path would let a process on the Docker host
+// register an arbitrary local service as a "router" (SSRF). Dev configurations
+// that target a localhost router seed it via the ROUTER_URLS env var at
+// startup, which does not go through this allowlist.
+const ALLOWED_ROUTER_DOMAINS = ['.xaiworkspace.com', '.xshopper.com'];
 
 // Loopback hostnames are exempt from the HTTPS requirement because traffic
 // never leaves the host and cannot be intercepted on the network path.
@@ -584,12 +589,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/api/routers' && req.method === 'POST') {
-    // Auth: require ROUTER_SECRET or any valid bridge token
+    // Auth: require ROUTER_SECRET or a valid bridge token.
+    // A prior "same-origin localhost" bypass was removed: any process on the
+    // Docker host (not just the intended web UI) could reach port 3100, so
+    // treating the loopback peer address as an authorization signal was
+    // unsafe. Callers must now present a credential.
     const hasSecret = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
     const hasToken = hasValidBridgeToken(req.headers['x-bridge-token']);
-    // Also allow unauthenticated requests from the web UI (same-origin localhost)
-    const isLocalhost = /^(127\.|::1|::ffff:127\.)/.test(req.socket?.remoteAddress || '');
-    if (!hasSecret && !hasToken && !isLocalhost) {
+    if (!hasSecret && !hasToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
@@ -633,11 +640,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/api/routers' && req.method === 'DELETE') {
-    // Same auth as POST
+    // Same auth as POST — no localhost bypass (see POST handler above).
     const hasSecretDel = ROUTER_SECRET && safeCompare(req.headers['x-router-secret'], ROUTER_SECRET);
     const hasTokenDel = hasValidBridgeToken(req.headers['x-bridge-token']);
-    const isLocalhostDel = /^(127\.|::1|::ffff:127\.)/.test(req.socket?.remoteAddress || '');
-    if (!hasSecretDel && !hasTokenDel && !isLocalhostDel) {
+    if (!hasSecretDel && !hasTokenDel) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
