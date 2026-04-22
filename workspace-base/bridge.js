@@ -51,7 +51,7 @@ const APPS_DIR = path.join(HOME, 'apps');
 process.env.PM2_HOME = process.env.PM2_HOME || `${WS_HOME}/.pm2`;
 
 // ── Agent version (reported to router; router can trigger self-update) ─────
-const AGENT_VERSION = '1.1.0';
+const AGENT_VERSION = '1.1.1';
 
 // ── Input validation patterns ──────────────────────────────────────────────
 const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
@@ -193,6 +193,9 @@ function handleMessage(msg) {
     case 'install_app': handleInstallApp(msg); break;
     case 'uninstall_app': handleUninstallApp(msg); break;
     case 'uninstall_app_instance': handleUninstallAppInstance(msg); break;
+    case 'stop_app_instance': handleStopAppInstance(msg); break;
+    case 'start_app_instance': handleStartAppInstance(msg); break;
+    case 'restart_app_instance': handleRestartAppInstance(msg); break;
     case 'restart_app': handleRestartApp(msg); break;
     case 'list_apps': handleListApps(msg); break;
     case 'exec': handleExec(msg); break;
@@ -425,23 +428,39 @@ async function handleSelfUpdate(msg) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDirCleaned = true;
 
-    // Small delay to let any in-flight WS sends flush before the process is replaced
+    // Send success BEFORE triggering restart — the pm2 SIGKILL reaches us
+    // before any unreachable line executes, and we can't signal the router
+    // once we're dead. Router infers final success from the reconnect with
+    // the new agentVersion; this ACK just prevents the router-side circuit
+    // breaker from misfiring.
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok', version });
+
+    // Let the WS `ok` flush.
     await new Promise(resolve => setTimeout(resolve, 200));
 
-    try {
-      execFileSync('pm2', ['restart', 'workspace-agent'], { timeout: 10000 });
-      // Unreachable on success — process is replaced. backupPath cleaned by entrypoint on next boot.
-    } catch (restartErr) {
-      // pm2 restart failed — files are already updated but process is still running.
-      // Roll back files and exit so pm2 auto-restarts with the old version.
-      console.error(`[workspace-agent] pm2 restart failed, rolling back:`, restartErr.message);
-      const rolledBackClean = rollback('pm2 restart failed');
-      send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'pm2 restart failed: ' + restartErr.message });
-      if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
-      // Delay exit so the error message can flush over WS, then let pm2 auto-restart old version
-      await new Promise(resolve => setTimeout(resolve, 200));
-      process.exit(0);
-    }
+    // DO NOT call `pm2 restart workspace-agent` directly — pm2 signals the
+    // current process mid-exec, the CLI returns non-zero before the daemon
+    // replaces us, we hit the catch, rollback, and exit with the old code.
+    // Infinite loop on router reconnect.
+    //
+    // Instead, spawn a DETACHED child that waits 500ms (for us to exit
+    // cleanly) then runs `pm2 restart workspace-agent`. Our own exit(0)
+    // triggers pm2 autorestart, which picks up the newly-staged bridge.js.
+    // If pm2 autorestart is off for some reason, the detached child's
+    // explicit restart covers it.
+    const { spawn } = require('child_process');
+    const child = spawn('sh', ['-c', 'sleep 0.5 && pm2 restart workspace-agent --update-env'], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, PM2_HOME: process.env.PM2_HOME || `${process.env.HOME}/.pm2` },
+    });
+    child.unref();
+
+    console.log(`[workspace-agent] Detached restart scheduled, exiting for pm2 respawn`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // Clean exit — pm2 autorestart (ecosystem.config.js autorestart: true)
+    // spins up a fresh process with the new bridge.js on disk.
+    process.exit(0);
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
     const rolledBackClean = rollback(err.message);
@@ -627,8 +646,13 @@ async function handleInstallApp(msg) {
         }
       }
 
-      await execAsync(`cp -a "${src}/." "${appDir}/"`, { timeout: 15000 });
-      await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}"`, { timeout: 15000 });
+      // `cp -a` preserves ownership — EFS access points (ECS workers) squash
+      // writes to a fixed UID and reject ownership preservation with EPERM,
+      // breaking the whole install. Use `-r --preserve=mode,timestamps` to
+      // keep permissions + mtime but let the kernel squash ownership silently.
+      await execAsync(`cp -r --preserve=mode,timestamps "${src}/." "${appDir}/"`, { timeout: 15000 });
+      // chown is a no-op on EFS AP but harmless on normal fs — keep for local bridges.
+      await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}" 2>/dev/null || true`, { timeout: 15000 });
       await execAsync(`rm -rf "${tmpFile}" "${tmpDir}"`);
     } else if (sourceUrl) {
       // Convert GitHub tree URLs to sparse checkout
@@ -640,8 +664,9 @@ async function handleInstallApp(msg) {
         await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
         await execAsync('git clone --depth 1 --filter=blob:none --sparse "' + repoUrl + '" ' + tmpSparse, { timeout: 120000 });
         await execAsync('cd ' + tmpSparse + ' && git sparse-checkout set "' + ghSubdir + '"', { timeout: 30000 });
-        await execAsync('cp -a ' + tmpSparse + '/' + ghSubdir + '/. ' + appDir + '/', { timeout: 15000 });
-        await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}"`, { timeout: 15000 });
+        // See cp -a EFS AP note above — preserve mode+timestamps only.
+        await execAsync('cp -r --preserve=mode,timestamps ' + tmpSparse + '/' + ghSubdir + '/. ' + appDir + '/', { timeout: 15000 });
+        await execAsync(`chown -R ${WS_USER}:${WS_USER} "${appDir}" 2>/dev/null || true`, { timeout: 15000 });
         await execAsync('rm -rf ' + tmpSparse, { timeout: 5000 }).catch(() => {});
       } else {
         // Clone fresh; if directory already exists from a previous install, remove it first
@@ -881,22 +906,133 @@ function handleUninstallAppInstance(msg) {
   console.log(`[workspace-agent] Instance stopped: ${procName}`);
 }
 
-// ── restart_app ─────────────────────────────────────────────────────────────
+// ── restart_app (legacy, slug-only) ─────────────────────────────────────────
+// Targets a single pm2 process by derived name. Honours `msg.name` so named
+// instances don't accidentally restart the `default` process.
 function handleRestartApp(msg) {
-  const { id, slug } = msg;
+  const { id, slug, name } = msg;
 
   // Validate slug before use in shell commands
   if (!slug || !SAFE_SLUG.test(slug)) {
     send({ type: 'restart_result', id, slug, status: 'error', error: 'Invalid slug' });
     return;
   }
+  if (name && name !== 'default' && !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    send({ type: 'restart_result', id, slug, name, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
+  const procName = (!name || name === 'default') ? slug : `${slug}--${name}`;
 
   try {
     // Use execFileSync to avoid shell injection
-    execFileSync('pm2', ['restart', slug], { timeout: 10000 });
-    send({ type: 'restart_result', id, slug, status: 'ok' });
+    execFileSync('pm2', ['restart', procName], { timeout: 10000 });
+    send({ type: 'restart_result', id, slug, name: name || 'default', status: 'ok' });
   } catch (err) {
-    send({ type: 'restart_result', id, slug, status: 'error', error: err.message });
+    send({ type: 'restart_result', id, slug, name: name || 'default', status: 'error', error: err.message });
+  }
+}
+
+// ── stop_app_instance / start_app_instance / restart_app_instance ──────────
+// Router-initiated pm2 lifecycle used by POST /api/mini-apps/:slug/{start,stop,restart}.
+// The DB status column is the source of truth the UI reads; these handlers
+// keep the pm2 process aligned with it. Process name is derived from
+// (slug, name) rather than trusting msg.processName blindly.
+
+function handleStopAppInstance(msg) {
+  const { slug, name } = msg;
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'stop_app_instance_result', slug, name, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+  if (name && name !== 'default' && !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    send({ type: 'stop_app_instance_result', slug, name, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
+  const procName = (!name || name === 'default') ? slug : `${slug}--${name}`;
+
+  try {
+    execFileSync('pm2', ['stop', procName], { timeout: 10000 });
+    send({ type: 'stop_app_instance_result', slug, name: name || 'default', status: 'ok' });
+    console.log(`[workspace-agent] pm2 stop ${procName}`);
+  } catch (err) {
+    const errMsg = err?.stderr?.toString?.() || err?.message || '';
+    // "process not found" is soft-ok: DB says stopped, pm2 agrees by absence.
+    if (/not found|does not exist|no process/i.test(errMsg)) {
+      send({ type: 'stop_app_instance_result', slug, name: name || 'default', status: 'ok', note: 'process not running' });
+    } else {
+      send({ type: 'stop_app_instance_result', slug, name: name || 'default', status: 'error', error: errMsg.slice(0, 500) });
+    }
+  }
+}
+
+function handleStartAppInstance(msg) {
+  const { slug, name } = msg;
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'start_app_instance_result', slug, name, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+  if (name && name !== 'default' && !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    send({ type: 'start_app_instance_result', slug, name, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
+  const procName = (!name || name === 'default') ? slug : `${slug}--${name}`;
+  const instName = name || 'default';
+
+  try {
+    execFileSync('pm2', ['start', procName], { timeout: 15000 });
+    send({ type: 'start_app_instance_result', slug, name: instName, status: 'ok' });
+    console.log(`[workspace-agent] pm2 start ${procName}`);
+    return;
+  } catch (err) {
+    const errMsg = err?.stderr?.toString?.() || err?.message || '';
+    // Only fall through to ecosystem-file restart when pm2 doesn't know the
+    // process name; other errors (e.g. user crash loop) are surfaced as-is.
+    if (!/not found|does not exist|no process|script not found/i.test(errMsg)) {
+      send({ type: 'start_app_instance_result', slug, name: instName, status: 'error', error: errMsg.slice(0, 500) });
+      return;
+    }
+  }
+
+  // Fallback: (re)spawn via ecosystem file so a deleted pm2 entry can be revived.
+  try {
+    const identifier = `com.xshopper.${slug}`;
+    const appDir = path.join(APPS_DIR, identifier);
+    const cjsName = instName === 'default' ? 'ecosystem.config.cjs' : `ecosystem.${instName}.config.cjs`;
+    const jsName = instName === 'default' ? 'ecosystem.config.js' : `ecosystem.${instName}.config.js`;
+    const ecoFile = fs.existsSync(path.join(appDir, cjsName))
+      ? path.join(appDir, cjsName)
+      : path.join(appDir, jsName);
+    if (fs.existsSync(ecoFile)) {
+      execFileSync('pm2', ['start', ecoFile, '--update-env'], { timeout: 30000 });
+      send({ type: 'start_app_instance_result', slug, name: instName, status: 'ok', note: 'restarted via ecosystem file' });
+      return;
+    }
+    send({ type: 'start_app_instance_result', slug, name: instName, status: 'error', error: 'process not found and no ecosystem file available' });
+  } catch (err) {
+    send({ type: 'start_app_instance_result', slug, name: instName, status: 'error', error: (err.message || 'pm2 start fallback failed').slice(0, 500) });
+  }
+}
+
+function handleRestartAppInstance(msg) {
+  const { slug, name } = msg;
+  if (!slug || !SAFE_SLUG.test(slug)) {
+    send({ type: 'restart_app_instance_result', slug, name, status: 'error', error: 'Invalid slug' });
+    return;
+  }
+  if (name && name !== 'default' && !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    send({ type: 'restart_app_instance_result', slug, name, status: 'error', error: 'Invalid instance name' });
+    return;
+  }
+  const procName = (!name || name === 'default') ? slug : `${slug}--${name}`;
+  const instName = name || 'default';
+
+  try {
+    execFileSync('pm2', ['restart', procName], { timeout: 15000 });
+    send({ type: 'restart_app_instance_result', slug, name: instName, status: 'ok' });
+    console.log(`[workspace-agent] pm2 restart ${procName}`);
+  } catch (err) {
+    const errMsg = err?.stderr?.toString?.() || err?.message || '';
+    send({ type: 'restart_app_instance_result', slug, name: instName, status: 'error', error: errMsg.slice(0, 500) });
   }
 }
 
