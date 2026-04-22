@@ -51,7 +51,7 @@ const APPS_DIR = path.join(HOME, 'apps');
 process.env.PM2_HOME = process.env.PM2_HOME || `${WS_HOME}/.pm2`;
 
 // ── Agent version (reported to router; router can trigger self-update) ─────
-const AGENT_VERSION = '1.1.1';
+const AGENT_VERSION = require('./package.json').version;
 
 // ── Input validation patterns ──────────────────────────────────────────────
 const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
