@@ -51,7 +51,7 @@ const APPS_DIR = path.join(HOME, 'apps');
 process.env.PM2_HOME = process.env.PM2_HOME || `${WS_HOME}/.pm2`;
 
 // ── Agent version (reported to router; router can trigger self-update) ─────
-const AGENT_VERSION = '1.1.1';
+const AGENT_VERSION = require('./package.json').version;
 
 // ── Input validation patterns ──────────────────────────────────────────────
 const SAFE_SLUG = /^[a-z0-9][a-z0-9._-]*$/;
@@ -559,8 +559,11 @@ async function handleInstallApp(msg) {
     try {
       restoreAppDir(appBackupPath, appDir);
       console.log(`[workspace-agent] App ${slug} restored from backup`);
-      // Restart the old pm2 process (startOrRestart handles already-running processes)
-      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      // Restart the old pm2 process (startOrRestart handles already-running processes).
+      // Prefer .cjs (generated + ESM-app-safe), fall back to .js.
+      const ecoCjs = path.join(appDir, 'ecosystem.config.cjs');
+      const ecoJs = path.join(appDir, 'ecosystem.config.js');
+      const ecoFile = fs.existsSync(ecoCjs) ? ecoCjs : ecoJs;
       if (fs.existsSync(ecoFile)) {
         await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 }).catch(() => {});
       } else {
@@ -720,7 +723,9 @@ async function handleInstallApp(msg) {
 
     // Upgrade mode: re-download code (done above), then restart ALL instances of this app
     if (upgrade) {
-      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      const upEcoCjs = path.join(appDir, 'ecosystem.config.cjs');
+      const upEcoJs = path.join(appDir, 'ecosystem.config.js');
+      const ecoFile = fs.existsSync(upEcoCjs) ? upEcoCjs : upEcoJs;
       if (fs.existsSync(ecoFile)) {
         await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
       }
@@ -743,7 +748,11 @@ async function handleInstallApp(msg) {
         APP_PARAMETERS: JSON.stringify(parameters || {}),
       };
 
-      const ecoFile = path.join(appDir, 'ecosystem.config.js');
+      // Prefer generated .cjs (safe under apps with "type":"module" like
+      // @connect) and fall back to shipped .js for legacy installs.
+      const ecoFileCjs = path.join(appDir, 'ecosystem.config.cjs');
+      const ecoFileJs = path.join(appDir, 'ecosystem.config.js');
+      const ecoFile = fs.existsSync(ecoFileCjs) ? ecoFileCjs : ecoFileJs;
       if (instName === 'default' && fs.existsSync(ecoFile)) {
         // Default instance with existing ecosystem file — use it as-is
         await execAsync(`pm2 startOrRestart "${ecoFile}" --update-env`, { timeout: 30000 });
@@ -752,8 +761,12 @@ async function handleInstallApp(msg) {
         // Build the config as a plain object and serialize the whole thing with
         // JSON.stringify to avoid any chance of template/string-concat injection
         // via user-controlled fields (processName, startupCmd, appDir, instanceEnv).
+        // Always write as .cjs so Node treats it as CommonJS even when the
+        // app package.json declares "type":"module".
         const startupCmd = manifest.startup;
-        const instanceEcoFile = instName === 'default' ? ecoFile : path.join(appDir, `ecosystem.${instName}.config.js`);
+        const instanceEcoFile = instName === 'default'
+          ? path.join(appDir, 'ecosystem.config.cjs')
+          : path.join(appDir, `ecosystem.${instName}.config.cjs`);
         const ecoConfig = {
           apps: [{
             name: processName,

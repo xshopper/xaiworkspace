@@ -1,10 +1,20 @@
 # Generic workspace base image — no mini-apps baked in.
 # Apps are installed at runtime by the router via the workspace agent.
+#
+# v1.2.0: baked python3 + python3-pip + ffmpeg + Kokoro TTS packages.
+# Required by the audiobook mini-app (apps/audiobook in xaiworkspaceApps).
+# Model files (~350 MB) are NOT baked — they are downloaded at first /generate
+# via lib/tts-install.js to $APP_DATA_DIR/kokoro/ (idempotent; SHA-256 pinned).
 FROM node:22-bookworm-slim
 
-# System tools needed by mini-apps
+# System tools needed by mini-apps.
+#
+# python3 + pip + ffmpeg are required by the audiobook mini-app TTS pipeline
+# (Kokoro-onnx worker + wav→mp3 conversion). Baking them into the base image
+# avoids each install trying to `apt-get` inside a sandboxed worker.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl git unzip sudo inotify-tools ca-certificates procps jq gnupg \
+      python3 python3-pip ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
        | gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg \
@@ -12,6 +22,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        > /etc/apt/sources.list.d/cloudflared.list \
     && apt-get update && apt-get install -y --no-install-recommends cloudflared \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-install kokoro-onnx TTS packages globally so audiobook mini-app lazy
+# installer only needs to download model assets, not Python packages. Global
+# install means per-chat users can import without per-user pip install churn
+# on ephemeral ECS task replacements (which would orphan ~/.local).
+#
+# --break-system-packages: Debian Bookworm ships PEP 668 EXTERNALLY-MANAGED
+# marker; this image is a controlled artifact so a root-owned global install
+# into /usr/lib/python3/dist-packages/ is acceptable (and desirable vs the
+# per-user /root/.local vs /home/xai<chat>/.local divergence issue).
+# Versions pinned to match lib/tts-install.js expectations.
+RUN pip3 install --break-system-packages --no-cache-dir --quiet \
+    kokoro-onnx==0.3.6 numpy>=1.26 onnxruntime>=1.17 soundfile>=0.12
 
 # pm2 + pnpm for process management and app dependencies
 RUN npm install -g pm2 pnpm --loglevel=error
