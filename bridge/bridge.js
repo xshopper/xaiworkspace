@@ -357,6 +357,16 @@ function handleMessage(msg, conn, routerUrl) {
     return;
   }
 
+  // ── Self-destruct (router-initiated bridge removal) ───────────────────
+  // Router has dropped this bridge from its DB and wants the container on
+  // the user's host torn down. We schedule `docker stop && docker rm` of our
+  // own container via a detached shell so the ACK message can flush over WS
+  // before the Docker daemon kills us.
+  if (msg.type === 'bridge_self_destruct') {
+    handleSelfDestruct(ws, routerUrl);
+    return;
+  }
+
   // ── Update check ──────────────────────────────────────────────────────
   if (msg.type === 'check_update') {
     console.log(`[bridge] Update check requested by ${routerUrl}`);
@@ -367,6 +377,49 @@ function handleMessage(msg, conn, routerUrl) {
     });
     return;
   }
+}
+
+// ── Self-destruct handler ─────────────────────────────────────────────────
+// Stops + removes our own Docker container from the host daemon. Uses
+// `require('os').hostname()` — inside a Docker container the default hostname
+// is the short container ID, which `docker stop`/`docker rm` accept.
+let selfDestructScheduled = false;
+function handleSelfDestruct(ws, routerUrl) {
+  if (selfDestructScheduled) {
+    console.log(`[bridge] bridge_self_destruct from ${routerUrl} — already scheduled`);
+    return;
+  }
+  selfDestructScheduled = true;
+  const containerId = require('os').hostname();
+  console.log(`[bridge] Self-destruct requested by ${routerUrl} — will stop+remove container ${containerId}`);
+
+  // ACK the router so the UI can close the spinner. Also gives us a moment for
+  // the WS frame to flush before docker kills us.
+  try {
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'bridge_self_destruct_ack', containerId }));
+    }
+  } catch { /* best effort */ }
+
+  // Schedule the actual teardown detached from this process so docker can
+  // reap us cleanly. setsid detaches from the pm2 process group so pm2 can't
+  // accidentally restart the killer.
+  const { spawn } = require('child_process');
+  try {
+    const child = spawn('/bin/sh', [
+      '-c',
+      `sleep 3; docker stop ${containerId} >/dev/null 2>&1; docker rm ${containerId} >/dev/null 2>&1`,
+    ], { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch (e) {
+    console.error(`[bridge] Failed to spawn self-destruct shell: ${e.message}`);
+  }
+
+  // Best-effort: exit pm2 so it doesn't fight the docker stop.
+  setTimeout(() => {
+    console.log('[bridge] Exiting for self-destruct');
+    try { process.exit(0); } catch {}
+  }, 1500);
 }
 
 // ── Update progress forwarding ────────────────────────────────────────────
