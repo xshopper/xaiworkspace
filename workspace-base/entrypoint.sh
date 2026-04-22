@@ -22,10 +22,16 @@ WS_USER="xai${SANITIZED:-default}"
 WS_USER="$(echo "$WS_USER" | tr '[:upper:]' '[:lower:]')"
 WS_HOME="/home/${WS_USER}"
 
-# Create user (idempotent — skip if exists)
+# Create user (idempotent — skip if exists).
+# UID/GID 10000 matches the EFS access point POSIX squash (fsap-*): all
+# writes on /home/ appear as 10000:10000 at the filesystem level. Creating
+# the Linux user with the same UID/GID makes chown a no-op and lets the
+# user actually read/write its own files. Without this, `useradd -m` picks
+# a low UID (1000+) and every chown on EFS fails with EPERM.
 if ! id "$WS_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$WS_USER"
-  echo "[entrypoint] Created user $WS_USER"
+  groupadd -g 10000 "$WS_USER" 2>/dev/null || true
+  useradd -m -s /bin/bash -u 10000 -g 10000 "$WS_USER"
+  echo "[entrypoint] Created user $WS_USER (uid 10000)"
 else
   echo "[entrypoint] User $WS_USER already exists"
 fi
@@ -33,13 +39,16 @@ fi
 # Ensure home directories exist
 mkdir -p "$WS_HOME/apps" "$WS_HOME/.openclaw" "$WS_HOME/.npm" "$WS_HOME/.local"
 
-# Copy secrets to user-owned location (mode 600, owned by user)
+# Copy secrets to user-owned location (mode 600, owned by user).
+# On EFS, chown may be squashed to 10000:10000 by the access point — that
+# is fine because WS_USER is now also UID 10000. Silencing chown errors
+# so the script survives edge cases where the AP rejects same-UID chown.
 cp "$SECRETS_FILE" "$WS_HOME/.openclaw/secrets.env"
-chown "$WS_USER:$WS_USER" "$WS_HOME/.openclaw/secrets.env"
+chown "$WS_USER:$WS_USER" "$WS_HOME/.openclaw/secrets.env" 2>/dev/null || true
 chmod 600 "$WS_HOME/.openclaw/secrets.env"
 
-# Set ownership of entire home dir
-chown -R "$WS_USER:$WS_USER" "$WS_HOME"
+# Set ownership of entire home dir — best effort on EFS.
+chown -R "$WS_USER:$WS_USER" "$WS_HOME" 2>/dev/null || true
 
 # Migrate old /home/workspace/ data if it exists and isn't the new home
 if [ -d /home/workspace/apps ] && [ "/home/workspace" != "$WS_HOME" ]; then
