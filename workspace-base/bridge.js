@@ -428,23 +428,39 @@ async function handleSelfUpdate(msg) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDirCleaned = true;
 
-    // Small delay to let any in-flight WS sends flush before the process is replaced
+    // Send success BEFORE triggering restart — the pm2 SIGKILL reaches us
+    // before any unreachable line executes, and we can't signal the router
+    // once we're dead. Router infers final success from the reconnect with
+    // the new agentVersion; this ACK just prevents the router-side circuit
+    // breaker from misfiring.
+    send({ type: 'install_result', id, slug: 'bootstrap', status: 'ok', version });
+
+    // Let the WS `ok` flush.
     await new Promise(resolve => setTimeout(resolve, 200));
 
-    try {
-      execFileSync('pm2', ['restart', 'workspace-agent'], { timeout: 10000 });
-      // Unreachable on success — process is replaced. backupPath cleaned by entrypoint on next boot.
-    } catch (restartErr) {
-      // pm2 restart failed — files are already updated but process is still running.
-      // Roll back files and exit so pm2 auto-restarts with the old version.
-      console.error(`[workspace-agent] pm2 restart failed, rolling back:`, restartErr.message);
-      const rolledBackClean = rollback('pm2 restart failed');
-      send({ type: 'install_result', id, slug: 'bootstrap', status: 'error', error: 'pm2 restart failed: ' + restartErr.message });
-      if (rolledBackClean) fs.rmSync(backupPath, { recursive: true, force: true });
-      // Delay exit so the error message can flush over WS, then let pm2 auto-restart old version
-      await new Promise(resolve => setTimeout(resolve, 200));
-      process.exit(0);
-    }
+    // DO NOT call `pm2 restart workspace-agent` directly — pm2 signals the
+    // current process mid-exec, the CLI returns non-zero before the daemon
+    // replaces us, we hit the catch, rollback, and exit with the old code.
+    // Infinite loop on router reconnect.
+    //
+    // Instead, spawn a DETACHED child that waits 500ms (for us to exit
+    // cleanly) then runs `pm2 restart workspace-agent`. Our own exit(0)
+    // triggers pm2 autorestart, which picks up the newly-staged bridge.js.
+    // If pm2 autorestart is off for some reason, the detached child's
+    // explicit restart covers it.
+    const { spawn } = require('child_process');
+    const child = spawn('sh', ['-c', 'sleep 0.5 && pm2 restart workspace-agent --update-env'], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, PM2_HOME: process.env.PM2_HOME || `${process.env.HOME}/.pm2` },
+    });
+    child.unref();
+
+    console.log(`[workspace-agent] Detached restart scheduled, exiting for pm2 respawn`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // Clean exit — pm2 autorestart (ecosystem.config.js autorestart: true)
+    // spins up a fresh process with the new bridge.js on disk.
+    process.exit(0);
   } catch (err) {
     console.error(`[workspace-agent] Self-update failed:`, err.message);
     const rolledBackClean = rollback(err.message);
